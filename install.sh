@@ -31,11 +31,6 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [[ "$REPO_RAW_URL" == *"ВАШ_ЛОГИН"* ]]; then
-    c_red "Сначала отредактируйте REPO_RAW_URL в начале этого скрипта — укажите ссылку на ваш GitHub-репозиторий!"
-    exit 1
-fi
-
 FIRST_INSTALL=false
 if [[ ! -d "$INSTALL_DIR" ]]; then
     FIRST_INSTALL=true
