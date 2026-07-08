@@ -14,7 +14,7 @@ set -euo pipefail
 # bot.py, requirements.txt, VERSION.
 # Пример: репозиторий https://github.com/USERNAME/REPO, файлы в ветке main ->
 #   https://raw.githubusercontent.com/USERNAME/REPO/main
-REPO_RAW_URL="https://raw.githubusercontent.com/ВАШ_ЛОГИН/ВАШ_РЕПОЗИТОРИЙ/main"   # <-- ВСТАВЬТЕ СЮДА ССЫЛКУ
+REPO_RAW_URL="https://raw.githubusercontent.com/drimty/testbot/main"   # <-- ВСТАВЬТЕ СЮДА ССЫЛКУ
 # -----------------------------------------------------------------------------
 
 INSTALL_DIR="/opt/bugtracker-bot"
