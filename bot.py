@@ -745,13 +745,22 @@ async def cmd_panel(message: Message):
     if not is_admin(message.from_user.id):
         return  # не-админам в группе молча не отвечаем
 
-    # message.answer сам подставит текущую тему форума — thread id указывать не нужно.
-    sent = await message.answer(PANEL_TEXT, reply_markup=open_bot_keyboard())
+    # Публикация панели: логируем любую ошибку, чтобы она была видна в journalctl,
+    # а не проваливалась молча.
+    try:
+        # message.answer сам подставит текущую тему форума — thread id не нужен.
+        sent = await message.answer(PANEL_TEXT, reply_markup=open_bot_keyboard())
+    except Exception:
+        log.exception("Не удалось опубликовать панель в чате %s", message.chat.id)
+        await message.reply("⚠️ Не удалось опубликовать панель — детали в логах бота.")
+        return
+
     schedule_delete(message.bot, message.chat.id, message.message_id)  # уберём саму команду /panel
+
     try:
         await message.bot.pin_chat_message(sent.chat.id, sent.message_id, disable_notification=True)
-    except Exception as e:
-        log.warning("Не удалось закрепить панель: %s", e)
+    except Exception:
+        log.warning("Не удалось закрепить панель в чате %s (нет прав?)", message.chat.id, exc_info=True)
         await message.answer(
             "Панель опубликована — закрепите её вручную (у бота нет права закреплять сообщения).",
             disable_notification=True,
