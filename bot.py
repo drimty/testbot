@@ -12,7 +12,7 @@ import logging
 import os
 import sqlite3
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape as h
 from pathlib import Path
 
@@ -67,6 +67,14 @@ STATUS_CODES = {"n": STATUS_NEW, "p": STATUS_IN_PROGRESS, "d": STATUS_DONE, "r":
 TYPE_LABELS = {"bug": "🐞 Баг", "feature": "💡 Фича"}
 
 router = Router()
+# Игнорируем апдейты без отправителя (посты от имени канала, анонимные админы),
+# иначе обращение к message.from_user.id уронит хендлеры.
+router.message.filter(F.from_user)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 
 # ---------------------------------------------------------------------------
 # База данных
@@ -97,7 +105,7 @@ def db_init() -> None:
 
 
 def db_add_ticket(ticket_type, text, user_id, username, full_name, chat_id, message_id) -> int:
-    now = datetime.utcnow().isoformat(timespec="seconds")
+    now = _now()
     with closing(sqlite3.connect(DB_PATH)) as con:
         cur = con.execute(
             """
@@ -143,7 +151,7 @@ def db_list_user_tickets(user_id: int, limit: int = 10):
 
 
 def db_update_status(ticket_id: int, status: str) -> None:
-    now = datetime.utcnow().isoformat(timespec="seconds")
+    now = _now()
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.execute(
             "UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?",
@@ -153,7 +161,7 @@ def db_update_status(ticket_id: int, status: str) -> None:
 
 
 def db_update_comment(ticket_id: int, comment: str) -> None:
-    now = datetime.utcnow().isoformat(timespec="seconds")
+    now = _now()
     with closing(sqlite3.connect(DB_PATH)) as con:
         con.execute(
             "UPDATE tickets SET admin_comment = ?, updated_at = ? WHERE id = ?",
@@ -169,6 +177,21 @@ def db_update_comment(ticket_id: int, comment: str) -> None:
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+async def admin_command_blocked(message: Message) -> bool:
+    """Гард для админ-команд. Возвращает True (и уведомляет), если выполнять нельзя.
+
+    Проверка приватного чата идёт первой, чтобы не раскрывать список
+    администраторов в группах.
+    """
+    if message.chat.type != "private":
+        await message.reply("⛔ Административные команды работают только в личном чате с ботом.")
+        return True
+    if not is_admin(message.from_user.id):
+        await message.reply("⛔ Эта команда доступна только администратору.")
+        return True
+    return False
 
 
 def format_ticket_short(t: dict) -> str:
@@ -290,14 +313,15 @@ async def _create_ticket(message: Message, command: CommandObject, ticket_type: 
 
     text = command.args.strip()
     user = message.from_user
-    ticket_id = db_add_ticket(
-        ticket_type=ticket_type,
-        text=text,
-        user_id=user.id,
-        username=user.username or "",
-        full_name=user.full_name,
-        chat_id=message.chat.id,
-        message_id=message.message_id,
+    ticket_id = await asyncio.to_thread(
+        db_add_ticket,
+        ticket_type,
+        text,
+        user.id,
+        user.username or "",
+        user.full_name,
+        message.chat.id,
+        message.message_id,
     )
     label = "Баг" if ticket_type == "bug" else "Запрос фичи"
     await message.reply(
@@ -321,8 +345,12 @@ async def cmd_status(message: Message, command: CommandObject):
     if not command.args or not command.args.strip().isdigit():
         await message.reply("⚠️ Укажите номер заявки: <code>/status 5</code>")
         return
-    ticket = db_get_ticket(int(command.args.strip()))
+    ticket = await asyncio.to_thread(db_get_ticket, int(command.args.strip()))
     if not ticket:
+        await message.reply("❌ Заявка с таким номером не найдена.")
+        return
+    # Неадмин может просматривать только собственные заявки.
+    if not is_admin(message.from_user.id) and ticket["user_id"] != message.from_user.id:
         await message.reply("❌ Заявка с таким номером не найдена.")
         return
     await message.reply(format_ticket_full(ticket))
@@ -330,7 +358,7 @@ async def cmd_status(message: Message, command: CommandObject):
 
 @router.message(Command("mytickets"))
 async def cmd_mytickets(message: Message):
-    tickets = db_list_user_tickets(message.from_user.id)
+    tickets = await asyncio.to_thread(db_list_user_tickets, message.from_user.id)
     if not tickets:
         await message.reply("У вас пока нет заявок.")
         return
@@ -345,8 +373,7 @@ async def cmd_mytickets(message: Message):
 
 @router.message(Command("list"))
 async def cmd_list(message: Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        await message.reply("⛔ Эта команда доступна только администратору.")
+    if await admin_command_blocked(message):
         return
 
     arg = (command.args or "new").strip().lower()
@@ -355,7 +382,7 @@ async def cmd_list(message: Message, command: CommandObject):
         await message.reply("⚠️ Неизвестный статус. Используйте: new, in_progress, done, rejected, all")
         return
 
-    tickets = db_list_tickets(status=status)
+    tickets = await asyncio.to_thread(db_list_tickets, status)
     if not tickets:
         await message.reply("Заявок не найдено.")
         return
@@ -366,14 +393,13 @@ async def cmd_list(message: Message, command: CommandObject):
 
 @router.message(Command("view"))
 async def cmd_view(message: Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        await message.reply("⛔ Эта команда доступна только администратору.")
+    if await admin_command_blocked(message):
         return
     if not command.args or not command.args.strip().isdigit():
         await message.reply("⚠️ Укажите номер заявки: <code>/view 5</code>")
         return
 
-    ticket = db_get_ticket(int(command.args.strip()))
+    ticket = await asyncio.to_thread(db_get_ticket, int(command.args.strip()))
     if not ticket:
         await message.reply("❌ Заявка с таким номером не найдена.")
         return
@@ -383,8 +409,7 @@ async def cmd_view(message: Message, command: CommandObject):
 
 @router.message(Command("setstatus"))
 async def cmd_setstatus(message: Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        await message.reply("⛔ Эта команда доступна только администратору.")
+    if await admin_command_blocked(message):
         return
 
     parts = (command.args or "").split()
@@ -393,20 +418,19 @@ async def cmd_setstatus(message: Message, command: CommandObject):
         return
 
     ticket_id, status = int(parts[0]), parts[1]
-    ticket = db_get_ticket(ticket_id)
+    ticket = await asyncio.to_thread(db_get_ticket, ticket_id)
     if not ticket:
         await message.reply("❌ Заявка с таким номером не найдена.")
         return
 
-    db_update_status(ticket_id, status)
+    await asyncio.to_thread(db_update_status, ticket_id, status)
     await message.reply(f"✅ Статус заявки #{ticket_id} изменён на: {STATUS_LABELS[status]}")
     await notify_group(message.bot, ticket, f"🔔 Статус вашей заявки #{ticket_id} изменён: {STATUS_LABELS[status]}")
 
 
 @router.message(Command("comment"))
 async def cmd_comment(message: Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        await message.reply("⛔ Эта команда доступна только администратору.")
+    if await admin_command_blocked(message):
         return
 
     parts = (command.args or "").split(maxsplit=1)
@@ -415,12 +439,12 @@ async def cmd_comment(message: Message, command: CommandObject):
         return
 
     ticket_id, comment = int(parts[0]), parts[1].strip()
-    ticket = db_get_ticket(ticket_id)
+    ticket = await asyncio.to_thread(db_get_ticket, ticket_id)
     if not ticket:
         await message.reply("❌ Заявка с таким номером не найдена.")
         return
 
-    db_update_comment(ticket_id, comment)
+    await asyncio.to_thread(db_update_comment, ticket_id, comment)
     await message.reply(f"✅ Комментарий добавлен к заявке #{ticket_id}.")
     await notify_group(
         message.bot,
@@ -438,12 +462,16 @@ async def cb_set_status(callback: CallbackQuery):
     _, ticket_id_str, code = callback.data.split(":")
     ticket_id = int(ticket_id_str)
     status = STATUS_CODES.get(code)
-    ticket = db_get_ticket(ticket_id)
+    ticket = await asyncio.to_thread(db_get_ticket, ticket_id)
     if not ticket or not status:
         await callback.answer("❌ Заявка не найдена.", show_alert=True)
         return
 
-    db_update_status(ticket_id, status)
+    if ticket["status"] == status:
+        await callback.answer("Статус уже установлен.")
+        return
+
+    await asyncio.to_thread(db_update_status, ticket_id, status)
     ticket["status"] = status
     await callback.message.edit_text(format_ticket_full(ticket), reply_markup=status_keyboard(ticket_id))
     await callback.answer(f"Статус изменён: {STATUS_LABELS[status]}")
