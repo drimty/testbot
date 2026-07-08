@@ -147,6 +147,18 @@ journalctl -u bugtracker-bot -f
 /setstatus 1 done
 ```
 
+Опубликовать в группе закрепляемую панель с кнопкой «Открыть бота» (вызывать
+**в группе**, в нужной теме; бот попробует сам закрепить сообщение):
+```
+/panel
+```
+
+Очистить **все** заявки и начать нумерацию заново (например, после тестов).
+Требует подтверждения, сообщения в группе не трогает:
+```
+/reset CONFIRM
+```
+
 Узнать текущую версию бота:
 ```
 /version
@@ -232,6 +244,20 @@ sudo crontab -e
 ```bash
 0 3 * * * cp /opt/bugtracker-bot/tickets.db /root/backups/tickets-$(date +\%F).db
 ```
+
+### Очистить базу и начать заново
+
+Два способа:
+
+- **Командой бота:** в личном чате отправьте `/reset CONFIRM` — удалит все заявки
+  и сбросит нумерацию с #1 (сообщения в группе не трогает).
+- **На сервере** (полный сброс файла БД):
+  ```bash
+  sudo systemctl stop bugtracker-bot
+  sudo rm -f /opt/bugtracker-bot/tickets.db /opt/bugtracker-bot/tickets.db-wal /opt/bugtracker-bot/tickets.db-shm
+  sudo systemctl start bugtracker-bot
+  ```
+  Бот создаст пустую базу при запуске.
 
 ## 9. Диагностика
 

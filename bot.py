@@ -226,6 +226,19 @@ def db_update_comment(ticket_id: int, comment: str) -> None:
         con.commit()
 
 
+def db_reset() -> int:
+    """Удаляет все заявки и сбрасывает нумерацию. Возвращает число удалённых."""
+    with closing(_connect()) as con:
+        n = con.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
+        con.execute("DELETE FROM tickets")
+        try:
+            con.execute("DELETE FROM sqlite_sequence WHERE name='tickets'")
+        except sqlite3.OperationalError:
+            pass  # таблица счётчиков ещё не создана — нечего сбрасывать
+        con.commit()
+        return n
+
+
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
@@ -462,6 +475,12 @@ HELP_TEXT_ADMIN = """
 
 💬 Добавить комментарий (публикуется в группе):
 <code>/comment НОМЕР текст комментария</code>
+
+📌 Опубликовать в группе панель с кнопкой «Открыть бота» (вызывать в группе):
+<code>/panel</code>
+
+🗑 Очистить ВСЕ заявки и сбросить нумерацию:
+<code>/reset CONFIRM</code>
 
 ℹ️ Версия бота: <code>/version</code>"""
 
@@ -706,6 +725,55 @@ async def cmd_comment(message: Message, command: CommandObject):
         ticket,
         f"💬 Комментарий администратора к заявке #{ticket_id}:\n{h(comment)}",
     )
+
+
+PANEL_TEXT = (
+    "🤖 <b>Бот для багов и запросов фич</b>\n\n"
+    "• 🐞 Сообщить о баге: <code>/bug описание</code>\n"
+    "• 💡 Предложить фичу: <code>/feature описание</code>\n\n"
+    "Статус заявок и историю смотрите в личном чате — по кнопке ниже."
+)
+
+
+@router.message(Command("panel"))
+async def cmd_panel(message: Message):
+    # Панель нужно публиковать в группе (чтобы закрепить), поэтому обычный
+    # админ-гард (который требует лички) здесь не подходит.
+    if is_private(message):
+        await message.answer("Команду /panel вызывайте в группе — бот опубликует там панель для закрепления.")
+        return
+    if not is_admin(message.from_user.id):
+        return  # не-админам в группе молча не отвечаем
+
+    sent = await message.answer(
+        PANEL_TEXT,
+        reply_markup=open_bot_keyboard(),
+        message_thread_id=message.message_thread_id,
+    )
+    schedule_delete(message.bot, message.chat.id, message.message_id)  # уберём саму команду /panel
+    try:
+        await message.bot.pin_chat_message(sent.chat.id, sent.message_id, disable_notification=True)
+    except Exception as e:
+        log.warning("Не удалось закрепить панель: %s", e)
+        await message.answer(
+            "Панель опубликована — закрепите её вручную (у бота нет права закреплять сообщения).",
+            disable_notification=True,
+        )
+
+
+@router.message(Command("reset"))
+async def cmd_reset(message: Message, command: CommandObject):
+    if await admin_command_blocked(message):
+        return
+    if (command.args or "").strip() != "CONFIRM":
+        await message.answer(
+            "⚠️ Это <b>безвозвратно</b> удалит ВСЕ заявки и сбросит нумерацию с #1.\n"
+            "Сообщения в группе при этом не трогаются.\n\n"
+            "Для подтверждения отправьте:\n<code>/reset CONFIRM</code>"
+        )
+        return
+    n = await asyncio.to_thread(db_reset)
+    await message.answer(f"🗑 База очищена. Удалено заявок: <b>{n}</b>. Новые заявки начнутся с #1.")
 
 
 @router.callback_query(F.data.startswith("st:"))
