@@ -65,15 +65,18 @@ STATUS_NEW = "new"
 STATUS_IN_PROGRESS = "in_progress"
 STATUS_DONE = "done"
 STATUS_REJECTED = "rejected"
+STATUS_CANCELLED = "cancelled"
 
 STATUS_LABELS = {
     STATUS_NEW: "🆕 Новая",
     STATUS_IN_PROGRESS: "🔧 В работе",
     STATUS_DONE: "✅ Готово",
     STATUS_REJECTED: "🚫 Отклонено",
+    STATUS_CANCELLED: "🗑 Отменена",
 }
 
-# короткие коды статусов для callback_data (ограничение Telegram — 64 байта)
+# короткие коды статусов для инлайн-клавиатуры администратора (callback_data
+# ограничен 64 байтами). Отмена — действие пользователя, кнопки для неё нет.
 STATUS_CODES = {"n": STATUS_NEW, "p": STATUS_IN_PROGRESS, "d": STATUS_DONE, "r": STATUS_REJECTED}
 
 TYPE_LABELS = {"bug": "🐞 Баг", "feature": "💡 Фича"}
@@ -295,6 +298,19 @@ async def notify_group(bot: Bot, ticket: dict, text: str) -> None:
             log.error("Не удалось отправить сообщение в чат %s: %s", ticket["chat_id"], e2)
 
 
+async def notify_admins(bot: Bot, text: str) -> None:
+    """Рассылает уведомление всем администраторам в личные сообщения.
+
+    Если админ не начинал диалог с ботом, отправка не удастся — это ожидаемо,
+    просто логируем и продолжаем.
+    """
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            log.warning("Не удалось уведомить администратора %s: %s", admin_id, e)
+
+
 # ---------------------------------------------------------------------------
 # Хендлеры: обычные пользователи
 # ---------------------------------------------------------------------------
@@ -314,6 +330,9 @@ HELP_TEXT_USER = """
 📋 Мои заявки:
 <code>/mytickets</code>
 
+🗑 Отменить свою заявку (пока её не взяли в работу):
+<code>/cancel НОМЕР</code>
+
 Бот подтвердит получение заявки и напишет её номер. Когда статус
 изменится, бот ответит в этом же чате на ваше исходное сообщение."""
 
@@ -323,7 +342,7 @@ HELP_TEXT_ADMIN = """
 
 📋 Список новых заявок:
 <code>/list</code>
-Список по статусу: <code>/list new|in_progress|done|rejected|all</code>
+Список по статусу: <code>/list new|in_progress|done|rejected|cancelled|all</code>
 
 🔍 Открыть заявку и изменить статус кнопками:
 <code>/view НОМЕР</code>
@@ -418,6 +437,38 @@ async def cmd_mytickets(message: Message):
         return
     text = "\n\n".join(format_ticket_short(t) for t in tickets)
     await reply_long(message, f"<b>Ваши последние заявки:</b>\n\n{text}")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, command: CommandObject):
+    if not command.args or not command.args.strip().isdigit():
+        await message.reply("⚠️ Укажите номер заявки: <code>/cancel 5</code>")
+        return
+
+    ticket_id = int(command.args.strip())
+    ticket = await asyncio.to_thread(db_get_ticket, ticket_id)
+    # Чужие и несуществующие заявки неотличимы — не раскрываем чужие номера.
+    if not ticket or ticket["user_id"] != message.from_user.id:
+        await message.reply("❌ Заявка с таким номером не найдена.")
+        return
+    if ticket["status"] != STATUS_NEW:
+        await message.reply(
+            "⚠️ Отменить можно только новую заявку. "
+            "Эту уже обрабатывают — обратитесь к администратору."
+        )
+        return
+
+    await asyncio.to_thread(db_update_status, ticket_id, STATUS_CANCELLED)
+    await message.reply(f"🗑 Заявка #{ticket_id} отменена.")
+
+    author = f"@{h(ticket['username'])}" if ticket.get("username") else h(
+        ticket.get("full_name") or str(ticket["user_id"])
+    )
+    await notify_admins(
+        message.bot,
+        f"🗑 {author} отменил(а) заявку #{ticket_id} "
+        f"({TYPE_LABELS.get(ticket['type'], ticket['type'])}).",
+    )
 
 
 # ---------------------------------------------------------------------------
