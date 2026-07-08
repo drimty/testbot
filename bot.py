@@ -20,7 +20,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, ReplyParameters
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -32,9 +32,21 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_IDS = {
-    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
-}
+
+
+def _parse_admin_ids(raw: str) -> set[int]:
+    ids = set()
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            raise SystemExit(f"Ошибка: некорректный ADMIN_IDS — '{part}' не является числом")
+    return ids
+
+
+ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 DB_PATH = BASE_DIR / os.getenv("DB_PATH", "tickets.db")
 VERSION_FILE = BASE_DIR / "VERSION"
 
@@ -66,6 +78,9 @@ STATUS_CODES = {"n": STATUS_NEW, "p": STATUS_IN_PROGRESS, "d": STATUS_DONE, "r":
 
 TYPE_LABELS = {"bug": "🐞 Баг", "feature": "💡 Фича"}
 
+# Лимит длины одного сообщения в Telegram.
+TELEGRAM_MSG_LIMIT = 4096
+
 router = Router()
 # Игнорируем апдейты без отправителя (посты от имени канала, анонимные админы),
 # иначе обращение к message.from_user.id уронит хендлеры.
@@ -81,8 +96,16 @@ def _now() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _connect() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=30000")
+    return con
+
+
 def db_init() -> None:
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with closing(_connect()) as con:
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS tickets (
@@ -101,12 +124,14 @@ def db_init() -> None:
             )
             """
         )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON tickets(user_id)")
         con.commit()
 
 
 def db_add_ticket(ticket_type, text, user_id, username, full_name, chat_id, message_id) -> int:
     now = _now()
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with closing(_connect()) as con:
         cur = con.execute(
             """
             INSERT INTO tickets (type, status, text, user_id, username, full_name,
@@ -120,8 +145,7 @@ def db_add_ticket(ticket_type, text, user_id, username, full_name, chat_id, mess
 
 
 def db_get_ticket(ticket_id: int):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.row_factory = sqlite3.Row
+    with closing(_connect()) as con:
         row = con.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         return dict(row) if row else None
 
@@ -134,15 +158,13 @@ def db_list_tickets(status: str | None = None, limit: int = 15):
         params.append(status)
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.row_factory = sqlite3.Row
+    with closing(_connect()) as con:
         rows = con.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
 
 def db_list_user_tickets(user_id: int, limit: int = 10):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.row_factory = sqlite3.Row
+    with closing(_connect()) as con:
         rows = con.execute(
             "SELECT * FROM tickets WHERE user_id = ? ORDER BY id DESC LIMIT ?",
             (user_id, limit),
@@ -152,7 +174,7 @@ def db_list_user_tickets(user_id: int, limit: int = 10):
 
 def db_update_status(ticket_id: int, status: str) -> None:
     now = _now()
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with closing(_connect()) as con:
         con.execute(
             "UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?",
             (status, now, ticket_id),
@@ -162,7 +184,7 @@ def db_update_status(ticket_id: int, status: str) -> None:
 
 def db_update_comment(ticket_id: int, comment: str) -> None:
     now = _now()
-    with closing(sqlite3.connect(DB_PATH)) as con:
+    with closing(_connect()) as con:
         con.execute(
             "UPDATE tickets SET admin_comment = ?, updated_at = ? WHERE id = ?",
             (comment, now, ticket_id),
@@ -229,10 +251,42 @@ def status_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def split_message(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
+    """Режет текст на части по границам абзацев, укладываясь в лимит Telegram."""
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(block) > limit:  # одиночный блок длиннее лимита — режем жёстко
+            chunks.append(block[:limit])
+            block = block[limit:]
+        current = block
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def reply_long(message: Message, text: str) -> None:
+    for chunk in split_message(text):
+        await message.reply(chunk)
+
+
 async def notify_group(bot: Bot, ticket: dict, text: str) -> None:
     """Отправляет ответ в исходный чат как reply на сообщение с заявкой."""
     try:
-        await bot.send_message(ticket["chat_id"], text, reply_to_message_id=ticket["message_id"])
+        await bot.send_message(
+            ticket["chat_id"],
+            text,
+            reply_parameters=ReplyParameters(message_id=ticket["message_id"]),
+        )
     except Exception as e:  # сообщение могло быть удалено и т.п.
         log.warning("Не удалось ответить в исходный чат %s: %s", ticket["chat_id"], e)
         try:
@@ -363,7 +417,7 @@ async def cmd_mytickets(message: Message):
         await message.reply("У вас пока нет заявок.")
         return
     text = "\n\n".join(format_ticket_short(t) for t in tickets)
-    await message.reply(f"<b>Ваши последние заявки:</b>\n\n{text}")
+    await reply_long(message, f"<b>Ваши последние заявки:</b>\n\n{text}")
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +442,7 @@ async def cmd_list(message: Message, command: CommandObject):
         return
 
     text = "\n\n".join(format_ticket_short(t) for t in tickets)
-    await message.reply(f"<b>Заявки ({arg}):</b>\n\n{text}\n\nОткройте заявку командой <code>/view НОМЕР</code>")
+    await reply_long(message, f"<b>Заявки ({arg}):</b>\n\n{text}\n\nОткройте заявку командой <code>/view НОМЕР</code>")
 
 
 @router.message(Command("view"))
@@ -490,8 +544,15 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
     log.info("Бот запущен.")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+        log.info("Бот остановлен.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
