@@ -745,11 +745,8 @@ async def cmd_panel(message: Message):
     if not is_admin(message.from_user.id):
         return  # не-админам в группе молча не отвечаем
 
-    sent = await message.answer(
-        PANEL_TEXT,
-        reply_markup=open_bot_keyboard(),
-        message_thread_id=message.message_thread_id,
-    )
+    # message.answer сам подставит текущую тему форума — thread id указывать не нужно.
+    sent = await message.answer(PANEL_TEXT, reply_markup=open_bot_keyboard())
     schedule_delete(message.bot, message.chat.id, message.message_id)  # уберём саму команду /panel
     try:
         await message.bot.pin_chat_message(sent.chat.id, sent.message_id, disable_notification=True)
