@@ -22,12 +22,16 @@ from aiogram import Bot, BaseMiddleware, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     CallbackQuery,
+    ForceReply,
     InlineKeyboardMarkup,
     Message,
     ReplyParameters,
@@ -924,13 +928,12 @@ async def cmd_join(message: Message, command: CommandObject):
     )
 
 
-async def _create_ticket(message: Message, command: CommandObject, ticket_type: str):
-    if not command.args or not command.args.strip():
-        label = "/bug описание проблемы" if ticket_type == "bug" else "/feature описание идеи"
-        await message.reply(f"⚠️ Укажите текст после команды, например:\n<code>{label}</code>")
-        return
+class TicketForm(StatesGroup):
+    waiting_text = State()
 
-    text = command.args.strip()
+
+async def _finalize_ticket(message: Message, ticket_type: str, text: str) -> None:
+    """Создаёт заявку из готового текста (message — сообщение с описанием)."""
     user = message.from_user
     ticket_id = await asyncio.to_thread(
         db_add_ticket,
@@ -944,11 +947,32 @@ async def _create_ticket(message: Message, command: CommandObject, ticket_type: 
         message.message_thread_id,
     )
     label = "Баг" if ticket_type == "bug" else "Запрос фичи"
-    # Подтверждение silent — чтобы не шуметь уведомлениями в группе.
     await message.reply(
         f"✅ {label} принят, заявка <b>#{ticket_id}</b>.\n"
         f"Проверить статус: <code>/status {ticket_id}</code> (в личке /bot)",
         disable_notification=True,
+    )
+
+
+async def _start_ticket(
+    message: Message, command: CommandObject, ticket_type: str, state: FSMContext
+) -> None:
+    """Один шаг (/bug текст) — сразу создаём; без текста — просим описание."""
+    text = (command.args or "").strip()
+    if text:
+        await state.clear()
+        await _finalize_ticket(message, ticket_type, text)
+        return
+
+    # Двухшаговый ввод. ForceReply нужен, чтобы в группе с включённым Privacy
+    # Mode бот получил ответное сообщение (ответы на бота приходят всегда).
+    await state.set_state(TicketForm.waiting_text)
+    await state.update_data(ticket_type=ticket_type)
+    kind = "🐞 баге" if ticket_type == "bug" else "💡 фиче"
+    await message.reply(
+        f"✍️ Опишите, в чём суть ({kind}), одним сообщением — ответом на это сообщение.\n"
+        f"Отмена: /skip",
+        reply_markup=ForceReply(selective=True, input_field_placeholder="Опишите заявку одним сообщением…"),
     )
 
 
@@ -963,19 +987,33 @@ async def _reject_wrong_topic(message: Message, ticket_type: str) -> None:
 
 
 @router.message(Command("bug"))
-async def cmd_bug(message: Message, command: CommandObject):
+async def cmd_bug(message: Message, command: CommandObject, state: FSMContext):
     if not topic_allowed(message, BUG_TOPIC_ID):
         await _reject_wrong_topic(message, "bug")
         return
-    await _create_ticket(message, command, "bug")
+    await _start_ticket(message, command, "bug", state)
 
 
 @router.message(Command("feature"))
-async def cmd_feature(message: Message, command: CommandObject):
+async def cmd_feature(message: Message, command: CommandObject, state: FSMContext):
     if not topic_allowed(message, FEATURE_TOPIC_ID):
         await _reject_wrong_topic(message, "feature")
         return
-    await _create_ticket(message, command, "feature")
+    await _start_ticket(message, command, "feature", state)
+
+
+@router.message(TicketForm.waiting_text, Command("skip"))
+async def cmd_ticket_skip(message: Message, state: FSMContext):
+    await state.clear()
+    await message.reply("Отменено — заявка не создана.")
+
+
+@router.message(TicketForm.waiting_text, F.text, ~F.text.startswith("/"))
+async def cmd_ticket_text(message: Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_type = data.get("ticket_type", "bug")
+    await state.clear()
+    await _finalize_ticket(message, ticket_type, message.text.strip())
 
 
 @router.message(Command("status"))
@@ -1388,7 +1426,7 @@ async def main() -> None:
     global BOT_USERNAME
     db_init()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())  # FSM для двухшагового ввода /bug, /feature
     dp.include_router(router)
 
     me = await bot.get_me()
