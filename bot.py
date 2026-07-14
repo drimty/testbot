@@ -8,6 +8,7 @@ Bug / Feature Request Tracker Bot для Telegram.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -59,6 +60,10 @@ def _parse_optional_int(name: str, default: int | None = None) -> int | None:
 ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 DB_PATH = BASE_DIR / os.getenv("DB_PATH", "tickets.db")
 VERSION_FILE = BASE_DIR / "VERSION"
+
+# Файл с ролями и серверами (секретные данные, НЕ в git). Читается на каждый
+# запрос, поэтому правки применяются без перезапуска бота.
+ROLES_FILE = BASE_DIR / os.getenv("ROLES_FILE", "roles.json")
 
 # ID тем форума (message_thread_id), в которых принимаются команды. Пусто —
 # команда работает в любой теме/чате. Игнорируется вне форум-групп.
@@ -157,6 +162,18 @@ def db_init() -> None:
             con.execute("ALTER TABLE tickets ADD COLUMN message_thread_id INTEGER")
         con.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON tickets(user_id)")
+        # Реестр пользователей, зарегистрировавшихся через /signin.
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         con.commit()
 
 
@@ -237,6 +254,35 @@ def db_reset() -> int:
             pass  # таблица счётчиков ещё не создана — нечего сбрасывать
         con.commit()
         return n
+
+
+def db_upsert_user(user_id: int, username: str, full_name: str) -> bool:
+    """Сохраняет/обновляет пользователя. True — если запись новая."""
+    now = _now()
+    with closing(_connect()) as con:
+        is_new = con.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone() is None
+        con.execute(
+            """
+            INSERT INTO users (user_id, username, full_name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                full_name = excluded.full_name,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, username, full_name, now, now),
+        )
+        con.commit()
+        return is_new
+
+
+def db_list_users(limit: int = 500):
+    with closing(_connect()) as con:
+        rows = con.execute(
+            "SELECT * FROM users ORDER BY full_name COLLATE NOCASE, user_id LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -379,19 +425,24 @@ def topic_allowed(message: Message, expected_topic_id: int | None) -> bool:
     return message.message_thread_id == expected_topic_id
 
 
-def schedule_delete(bot: Bot, chat_id: int, message_id: int) -> None:
-    """Планирует удаление сообщения через EPHEMERAL_TTL секунд (если включено)."""
-    if EPHEMERAL_TTL <= 0:
-        return
+def delete_after(bot: Bot, chat_id: int, message_id: int, seconds: int) -> None:
+    """Удаляет сообщение через `seconds` секунд (0 — сразу). Ошибки не критичны."""
 
     async def _worker() -> None:
-        await asyncio.sleep(EPHEMERAL_TTL)
+        if seconds > 0:
+            await asyncio.sleep(seconds)
         try:
             await bot.delete_message(chat_id, message_id)
         except Exception as e:  # нет прав/уже удалено/старше 48ч — не критично
             log.debug("Не удалось удалить сообщение %s в чате %s: %s", message_id, chat_id, e)
 
     asyncio.create_task(_worker())
+
+
+def schedule_delete(bot: Bot, chat_id: int, message_id: int) -> None:
+    """Планирует эфемерное удаление через EPHEMERAL_TTL секунд (если включено)."""
+    if EPHEMERAL_TTL > 0:
+        delete_after(bot, chat_id, message_id, EPHEMERAL_TTL)
 
 
 async def ephemeral_reply(message: Message, text: str, **kwargs) -> Message:
@@ -413,6 +464,55 @@ async def redirect_to_private(message: Message, reason: str) -> None:
         f"{reason}\nНапишите мне в личный чат 👇",
         reply_markup=open_bot_keyboard(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Роли и серверы (данные из внешнего JSON-файла, вне git)
+# ---------------------------------------------------------------------------
+
+
+def load_roles_config() -> dict | None:
+    """Читает файл ролей. None — файл отсутствует/повреждён (детали в логе)."""
+    try:
+        with open(ROLES_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        log.warning("Файл ролей не найден: %s", ROLES_FILE)
+    except (json.JSONDecodeError, OSError):
+        log.error("Не удалось прочитать файл ролей %s", ROLES_FILE, exc_info=True)
+    return None
+
+
+def roles_for_user(cfg: dict, user_id: int) -> list[str]:
+    """Список ролей пользователя из секции users (строка или список)."""
+    raw = (cfg.get("users") or {}).get(str(user_id)) or []
+    return [raw] if isinstance(raw, str) else list(raw)
+
+
+def format_servers(cfg: dict, roles: list[str]) -> str:
+    """Форматирует серверы для указанных ролей (данные экранируются)."""
+    roles_def = cfg.get("roles") or {}
+    blocks = []
+    for role in roles:
+        rd = roles_def.get(role)
+        if not rd:
+            continue
+        lines = [f"<b>{h(rd.get('title', role))}</b>"]
+        servers = rd.get("servers") or []
+        if not servers:
+            lines.append("— серверы не заданы")
+        for s in servers:
+            if isinstance(s, str):
+                lines.append(f"• {h(s)}")
+                continue
+            name = h(str(s.get("name", "")))
+            host = h(str(s.get("host", "")))
+            line = f"• {name}" + (f" — <code>{host}</code>" if host else "")
+            if s.get("note"):
+                line += f" ({h(str(s['note']))})"
+            lines.append(line)
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 async def notify_admins(bot: Bot, text: str) -> None:
@@ -450,6 +550,12 @@ HELP_TEXT_USER = """
 🗑 Отменить свою заявку (пока её не взяли в работу):
 <code>/cancel НОМЕР</code>
 
+🖥 Серверы для тестирования (по вашей роли, только в личке):
+<code>/servers</code>
+
+🔐 Зарегистрироваться (отправить свои данные администратору):
+<code>/signin</code>
+
 🤖 Открыть личный чат с ботом:
 <code>/bot</code>
 
@@ -475,6 +581,9 @@ HELP_TEXT_ADMIN = """
 
 💬 Добавить комментарий (публикуется в группе):
 <code>/comment НОМЕР текст комментария</code>
+
+👥 Список зарегистрированных пользователей (id и имена):
+<code>/users</code>
 
 📌 Опубликовать в группе панель с кнопкой «Открыть бота» (вызывать в группе):
 <code>/panel</code>
@@ -606,6 +715,58 @@ async def cmd_mytickets(message: Message):
         return
     text = "\n\n".join(format_ticket_short(t) for t in tickets)
     await reply_long(message, f"<b>Ваши последние заявки:</b>\n\n{text}")
+
+
+@router.message(Command("servers"))
+async def cmd_servers(message: Message):
+    # Только в личке — чтобы не светить серверы в группе.
+    if not is_private(message):
+        await redirect_to_private(message, "🖥 Список серверов — только в личном чате.")
+        return
+
+    cfg = await asyncio.to_thread(load_roles_config)
+    if not cfg:
+        await message.answer("⚠️ Список серверов сейчас недоступен. Обратитесь к администратору.")
+        return
+
+    roles = [r for r in roles_for_user(cfg, message.from_user.id) if r in (cfg.get("roles") or {})]
+    if not roles:
+        await message.answer(
+            "У вас нет доступа к списку серверов.\n"
+            "Обратитесь к администратору, чтобы вам назначили роль."
+        )
+        return
+
+    await reply_long(message, f"🖥 <b>Доступные серверы</b>\n\n{format_servers(cfg, roles)}")
+
+
+# Сколько секунд показывать подтверждение /signin перед авто-удалением.
+SIGNIN_CONFIRM_TTL = 10
+
+
+@router.message(Command("signin"))
+async def cmd_signin(message: Message):
+    user = message.from_user
+    is_new = await asyncio.to_thread(db_upsert_user, user.id, user.username or "", user.full_name)
+
+    handle = f"@{h(user.username)}" if user.username else "—"
+    action = "🔐 Регистрация" if is_new else "🔁 Обновление данных"
+    await notify_admins(
+        message.bot,
+        f"{action} пользователя:\n"
+        f"Имя: {h(user.full_name)}\n"
+        f"Username: {handle}\n"
+        f"ID: <code>{user.id}</code>",
+    )
+
+    # Команду /signin удаляем сразу (независимо от EPHEMERAL_TTL), подтверждение
+    # показываем ненадолго и тоже убираем — чтобы не оставлять следов в теме.
+    delete_after(message.bot, message.chat.id, message.message_id, 0)
+    sent = await message.answer(
+        "✅ Готово! Ваши данные отправлены администратору.",
+        disable_notification=True,
+    )
+    delete_after(message.bot, sent.chat.id, sent.message_id, SIGNIN_CONFIRM_TTL)
 
 
 @router.message(Command("cancel"))
@@ -780,6 +941,21 @@ async def cmd_reset(message: Message, command: CommandObject):
         return
     n = await asyncio.to_thread(db_reset)
     await message.answer(f"🗑 База очищена. Удалено заявок: <b>{n}</b>. Новые заявки начнутся с #1.")
+
+
+@router.message(Command("users"))
+async def cmd_users(message: Message):
+    if await admin_command_blocked(message):
+        return
+    users = await asyncio.to_thread(db_list_users)
+    if not users:
+        await message.answer("Пока никто не зарегистрировался через /signin.")
+        return
+    lines = []
+    for u in users:
+        handle = f"@{h(u['username'])}" if u["username"] else "—"
+        lines.append(f"• {h(u['full_name'] or '—')} ({handle}) — <code>{u['user_id']}</code>")
+    await reply_long(message, f"<b>Зарегистрированные пользователи ({len(users)}):</b>\n\n" + "\n".join(lines))
 
 
 @router.callback_query(F.data.startswith("st:"))

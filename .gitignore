@@ -1,4 +1,5 @@
 .env
+roles.json
 tickets.db
 tickets.db-wal
 tickets.db-shm
