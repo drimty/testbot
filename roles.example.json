@@ -1,5 +1,5 @@
 {
-  "_comment": "Скопируйте этот файл в roles.json на сервере и заполните. roles.json в git не попадает (см. .gitignore). Бот перечитывает файл на каждый запрос /servers — перезапуск не нужен.",
+  "_comment": "Скопируйте в roles.json на сервере и заполните. roles.json в git не попадает. Бот перечитывает файл на каждый /servers — перезапуск не нужен. В Telegram тап по адресу/порту/имени БД/логину/паролю копирует значение в буфер.",
 
   "users": {
     "111111111": ["naladchik"],
@@ -10,15 +10,41 @@
     "naladchik": {
       "title": "Наладчик",
       "servers": [
-        {"name": "Стенд-1", "host": "10.0.0.5", "note": "основной"},
-        {"name": "Стенд-2", "host": "10.0.0.6"}
+        {
+          "title": "Группа серверов 1",
+          "hosts": [
+            {"address": "150.0.0.1", "port": 5432},
+            {"address": "150.0.0.2", "port": 5332}
+          ],
+          "db": "name_DB",
+          "accounts": [
+            {"username": "admin",  "password": "passForAdmin",  "desc": "суперпользователь"},
+            {"username": "editor", "password": "passForEditor", "desc": "редактор"},
+            {"username": "user",   "password": "passForUser",   "desc": "только просмотр, редактирование недоступно"}
+          ]
+        },
+        {
+          "title": "Сервер 2",
+          "hosts": [{"address": "150.0.1.10", "port": 5432}],
+          "db": "second_DB",
+          "accounts": [
+            {"username": "admin", "password": "secret2", "desc": "суперпользователь"}
+          ]
+        }
       ]
     },
+
     "metrolog": {
       "title": "Метролог",
       "servers": [
-        {"name": "Эталон-1", "host": "10.0.1.5"},
-        "Свободная строка тоже допустима вместо объекта"
+        {
+          "title": "Эталонный сервер",
+          "hosts": [{"address": "10.0.1.5", "port": 5432}],
+          "db": "etalon_DB",
+          "accounts": [
+            {"username": "readonly", "password": "ro_pass", "desc": "только просмотр"}
+          ]
+        }
       ]
     }
   }

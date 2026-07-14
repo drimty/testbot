@@ -489,29 +489,77 @@ def roles_for_user(cfg: dict, user_id: int) -> list[str]:
     return [raw] if isinstance(raw, str) else list(raw)
 
 
+def _code(value) -> str:
+    """Моноширинный фрагмент — в Telegram тап по нему копирует значение в буфер."""
+    return f"<code>{h(str(value))}</code>"
+
+
+def _server_hosts(block: dict) -> list:
+    """Нормализует список хостов сервера (может быть один или несколько)."""
+    hosts = block.get("hosts")
+    if hosts:
+        return hosts
+    if block.get("address"):  # одиночный хост, заданный прямо в блоке
+        return [{"address": block["address"], "port": block.get("port")}]
+    return []
+
+
+def _format_host(hb) -> str:
+    """Хост в виде 'address:port', каждое поле — отдельно копируемое."""
+    if isinstance(hb, str):
+        addr, _, port = hb.partition(":")
+    else:
+        addr, port = hb.get("address", ""), hb.get("port")
+    if not addr:
+        return ""
+    return _code(addr) + (f":{_code(port)}" if port not in (None, "") else "")
+
+
+def _format_server_block(srv) -> str:
+    if isinstance(srv, str):
+        return f"• {h(srv)}"
+    lines = []
+    if srv.get("title"):
+        lines.append(f"<b>{h(str(srv['title']))}</b>")
+    hosts = [s for s in (_format_host(h_) for h_ in _server_hosts(srv)) if s]
+    if hosts:
+        lines.append(", ".join(hosts))
+    if srv.get("db"):
+        lines.append(f"БД: {_code(srv['db'])}")
+    accounts = srv.get("accounts") or []
+    if accounts:
+        lines.append("Пользователи:")
+        for a in accounts:
+            if isinstance(a, str):
+                lines.append(h(a))
+                continue
+            entry = f"{_code(a.get('username', ''))}:{_code(a.get('password', ''))}"
+            desc = a.get("desc") or a.get("description")
+            if desc:
+                entry += f" — {h(str(desc))}"
+            lines.append(entry)
+    return "\n".join(lines)
+
+
 def format_servers(cfg: dict, roles: list[str]) -> str:
-    """Форматирует серверы для указанных ролей (данные экранируются)."""
+    """Форматирует серверы (PostgreSQL) для указанных ролей.
+
+    Все значения экранируются; адрес/порт/БД/логин/пароль обёрнуты в <code>,
+    чтобы в Telegram их можно было скопировать одним тапом по отдельности.
+    """
     roles_def = cfg.get("roles") or {}
     blocks = []
     for role in roles:
         rd = roles_def.get(role)
         if not rd:
             continue
-        lines = [f"<b>{h(rd.get('title', role))}</b>"]
+        role_title = f"<b>▣ {h(rd.get('title', role))}</b>"
         servers = rd.get("servers") or []
         if not servers:
-            lines.append("— серверы не заданы")
-        for s in servers:
-            if isinstance(s, str):
-                lines.append(f"• {h(s)}")
-                continue
-            name = h(str(s.get("name", "")))
-            host = h(str(s.get("host", "")))
-            line = f"• {name}" + (f" — <code>{host}</code>" if host else "")
-            if s.get("note"):
-                line += f" ({h(str(s['note']))})"
-            lines.append(line)
-        blocks.append("\n".join(lines))
+            blocks.append(f"{role_title}\n— серверы не заданы")
+            continue
+        server_blocks = "\n\n".join(_format_server_block(s) for s in servers)
+        blocks.append(f"{role_title}\n\n{server_blocks}")
     return "\n\n".join(blocks)
 
 

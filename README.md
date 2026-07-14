@@ -239,18 +239,40 @@ EPHEMERAL_TTL=60
    sudo nano /opt/bugtracker-bot/roles.json
    ```
 2. Структура файла: секция `users` сопоставляет **Telegram user id → список
-   ролей**, секция `roles` задаёт для каждой роли `title` и список `servers`.
-   Сервер можно описать объектом (`name`, `host`, `note`) или просто строкой.
+   ролей**, секция `roles` задаёт для каждой роли `title` и список серверов
+   PostgreSQL (`servers`). У каждого сервера-блока:
+   - `title` — заголовок блока;
+   - `hosts` — список хостов `{"address", "port"}` (если серверов несколько с
+     одинаковыми БД/пользователями, просто добавьте ещё элементы в `hosts`);
+   - `db` — имя базы;
+   - `accounts` — список `{"username", "password", "desc"}`.
    ```json
    {
-     "users": { "111111111": ["naladchik"], "222222222": ["metrolog", "naladchik"] },
+     "users": { "111111111": ["naladchik"] },
      "roles": {
-       "naladchik": { "title": "Наладчик", "servers": [ {"name": "Стенд-1", "host": "10.0.0.5"} ] },
-       "metrolog":  { "title": "Метролог", "servers": [ {"name": "Эталон-1", "host": "10.0.1.5"} ] }
+       "naladchik": {
+         "title": "Наладчик",
+         "servers": [
+           {
+             "title": "Группа серверов 1",
+             "hosts": [
+               {"address": "150.0.0.1", "port": 5432},
+               {"address": "150.0.0.2", "port": 5332}
+             ],
+             "db": "name_DB",
+             "accounts": [
+               {"username": "admin",  "password": "passForAdmin",  "desc": "суперпользователь"},
+               {"username": "editor", "password": "passForEditor", "desc": "редактор"},
+               {"username": "user",   "password": "passForUser",   "desc": "только просмотр"}
+             ]
+           }
+         ]
+       }
      }
    }
    ```
-3. Права на файл (в нём чувствительные данные):
+   Полный пример — в `roles.example.json`.
+3. Права на файл (в нём чувствительные данные, включая пароли):
    ```bash
    sudo chown bugtracker:bugtracker /opt/bugtracker-bot/roles.json
    sudo chmod 600 /opt/bugtracker-bot/roles.json
@@ -259,6 +281,10 @@ EPHEMERAL_TTL=60
 Файл **перечитывается на каждый запрос** `/servers`, поэтому после правок
 перезапуск бота не нужен. Если у пользователя нет роли (или файл отсутствует),
 бот вежливо сообщит, что доступа нет / список недоступен, и запишет причину в лог.
+
+**Копирование по клику:** адрес, порт, имя БД, логин и пароль выводятся
+моноширинным шрифтом — в официальных клиентах Telegram тап (клик) по такому
+полю копирует именно его в буфер обмена.
 
 > Почему не Telegram-метка (custom title): её можно читать через API, но только
 > для **администраторов** группы и лишь **одну** на человека. Для обычных
