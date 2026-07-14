@@ -12,12 +12,13 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from html import escape as h
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, BaseMiddleware, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
@@ -74,6 +75,11 @@ FEATURE_TOPIC_ID = _parse_optional_int("FEATURE_TOPIC_ID")
 # редиректы, подсказки). 0 — не удалять. Удаление чужих сообщений требует у
 # бота права администратора «Удалять сообщения».
 EPHEMERAL_TTL = _parse_optional_int("EPHEMERAL_TTL", 0) or 0
+
+# ID основной группы. Если задан — в личном чате бот отвечает только участникам
+# группы; остальным доступна лишь команда /join (заявка на вступление).
+# Пусто — ограничение выключено, бот доступен всем (как раньше).
+GROUP_ID = _parse_optional_int("GROUP_ID")
 
 # Заполняется в main() из bot.get_me() — нужно для deep-link в личный чат.
 BOT_USERNAME = ""
@@ -169,6 +175,19 @@ def db_init() -> None:
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 full_name TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        # Заявки на вступление в группу (/join).
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS join_requests (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                note TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -283,6 +302,43 @@ def db_list_users(limit: int = 500):
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def db_add_join_request(user_id: int, username: str, full_name: str, note: str) -> bool:
+    """Сохраняет/обновляет заявку на вступление. True — если заявка новая."""
+    now = _now()
+    with closing(_connect()) as con:
+        is_new = con.execute(
+            "SELECT 1 FROM join_requests WHERE user_id = ?", (user_id,)
+        ).fetchone() is None
+        con.execute(
+            """
+            INSERT INTO join_requests (user_id, username, full_name, note, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                full_name = excluded.full_name,
+                note = excluded.note,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, username, full_name, note, now, now),
+        )
+        con.commit()
+        return is_new
+
+
+def db_list_join_requests(limit: int = 500):
+    with closing(_connect()) as con:
+        rows = con.execute(
+            "SELECT * FROM join_requests ORDER BY created_at LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def db_delete_join_request(user_id: int) -> None:
+    with closing(_connect()) as con:
+        con.execute("DELETE FROM join_requests WHERE user_id = ?", (user_id,))
+        con.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +633,84 @@ async def notify_admins(bot: Bot, text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Ограничение доступа по членству в группе
+# ---------------------------------------------------------------------------
+
+# Кэш членства: user_id -> (is_member, monotonic_ts). Снижает число вызовов API.
+_MEMBER_STATUSES_IN = {"creator", "administrator", "member"}
+_member_cache: dict[int, tuple[bool, float]] = {}
+MEMBER_CACHE_TTL = 60
+# Команды, доступные не-участникам в личном чате (всё остальное скрыто).
+NONMEMBER_ALLOWED_CMDS = {"join"}
+
+
+async def is_group_member(bot: Bot, user_id: int) -> bool:
+    """Проверяет членство пользователя в GROUP_ID (с кэшем на MEMBER_CACHE_TTL c)."""
+    if GROUP_ID is None:
+        return True
+    now = time.monotonic()
+    cached = _member_cache.get(user_id)
+    if cached and now - cached[1] < MEMBER_CACHE_TTL:
+        return cached[0]
+    try:
+        member = await bot.get_chat_member(GROUP_ID, user_id)
+        status = member.status
+        if status in _MEMBER_STATUSES_IN:
+            ok = True
+        elif status == "restricted":
+            ok = bool(getattr(member, "is_member", False))
+        else:  # left / kicked
+            ok = False
+    except Exception:
+        # «user not found», нет прав и т.п. — считаем, что не участник.
+        log.debug("get_chat_member(%s, %s) не удался", GROUP_ID, user_id, exc_info=True)
+        ok = False
+    _member_cache[user_id] = (ok, now)
+    return ok
+
+
+def _command_name(text: str | None) -> str | None:
+    if not text or not text.startswith("/"):
+        return None
+    token = text[1:].split(maxsplit=1)[0] if len(text) > 1 else ""
+    return token.split("@")[0].lower() or None
+
+
+async def send_join_prompt(message: Message) -> None:
+    await message.answer(
+        "🚪 Этот бот доступен только участникам группы.\n\n"
+        "Чтобы получить доступ, подайте заявку на вступление командой "
+        "<code>/join</code> (можно добавить короткий комментарий: "
+        "<code>/join я из отдела наладки</code>). Администраторы её рассмотрят."
+    )
+
+
+class MembershipMiddleware(BaseMiddleware):
+    """В личном чате пропускает только участников группы и админов бота.
+
+    Остальным доступна лишь команда /join — на прочее бот отвечает
+    приглашением подать заявку. Работает, только если задан GROUP_ID.
+    """
+
+    async def __call__(self, handler, event: Message, data):
+        if (
+            GROUP_ID is not None
+            and getattr(event, "chat", None) is not None
+            and event.chat.type == "private"
+            and event.from_user is not None
+            and not is_admin(event.from_user.id)
+        ):
+            if not await is_group_member(event.bot, event.from_user.id):
+                if _command_name(event.text) not in NONMEMBER_ALLOWED_CMDS:
+                    await send_join_prompt(event)
+                    return None
+        return await handler(event, data)
+
+
+router.message.outer_middleware(MembershipMiddleware())
+
+
+# ---------------------------------------------------------------------------
 # Хендлеры: обычные пользователи
 # ---------------------------------------------------------------------------
 
@@ -633,6 +767,9 @@ HELP_TEXT_ADMIN = """
 👥 Список зарегистрированных пользователей (id и имена):
 <code>/users</code>
 
+🚪 Заявки на вступление в группу:
+<code>/requests</code>
+
 📌 Опубликовать в группе панель с кнопкой «Открыть бота» (вызывать в группе):
 <code>/panel</code>
 
@@ -677,6 +814,35 @@ async def cmd_bot(message: Message):
 async def cmd_version(message: Message):
     version = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "неизвестно"
     await message.answer(f"Версия бота: <code>{h(version)}</code>")
+
+
+@router.message(Command("join"))
+async def cmd_join(message: Message, command: CommandObject):
+    user = message.from_user
+    # Уже участник (или админ бота) — заявка не нужна.
+    if is_admin(user.id) or await is_group_member(message.bot, user.id):
+        await message.answer("✅ Вы уже участник группы — заявка не нужна.")
+        return
+
+    note = (command.args or "").strip()[:500]
+    is_new = await asyncio.to_thread(
+        db_add_join_request, user.id, user.username or "", user.full_name, note
+    )
+
+    handle = f"@{h(user.username)}" if user.username else "—"
+    text = (
+        f"🚪 {'Новая заявка' if is_new else 'Повторная заявка'} на вступление:\n"
+        f"Имя: {h(user.full_name)}\n"
+        f"Username: {handle}\n"
+        f"ID: <code>{user.id}</code>"
+    )
+    if note:
+        text += f"\nКомментарий: {h(note)}"
+    await notify_admins(message.bot, text)
+
+    await message.answer(
+        "✅ Заявка на вступление отправлена администраторам. Ожидайте — вас добавят вручную."
+    )
 
 
 async def _create_ticket(message: Message, command: CommandObject, ticket_type: str):
@@ -1006,6 +1172,34 @@ async def cmd_users(message: Message):
     await reply_long(message, f"<b>Зарегистрированные пользователи ({len(users)}):</b>\n\n" + "\n".join(lines))
 
 
+@router.message(Command("requests"))
+async def cmd_requests(message: Message):
+    if await admin_command_blocked(message):
+        return
+    reqs = await asyncio.to_thread(db_list_join_requests)
+
+    # Самоочистка: тех, кто уже вступил в группу, убираем из списка ожидающих.
+    pending = []
+    for r in reqs:
+        if GROUP_ID is not None and await is_group_member(message.bot, r["user_id"]):
+            await asyncio.to_thread(db_delete_join_request, r["user_id"])
+            continue
+        pending.append(r)
+
+    if not pending:
+        await message.answer("Нет ожидающих заявок на вступление.")
+        return
+
+    lines = []
+    for r in pending:
+        handle = f"@{h(r['username'])}" if r["username"] else "—"
+        line = f"• {h(r['full_name'] or '—')} ({handle}) — <code>{r['user_id']}</code>"
+        if r.get("note"):
+            line += f"\n  «{h(r['note'])}»"
+        lines.append(line)
+    await reply_long(message, f"<b>Заявки на вступление ({len(pending)}):</b>\n\n" + "\n".join(lines))
+
+
 @router.callback_query(F.data.startswith("st:"))
 async def cb_set_status(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1051,6 +1245,8 @@ async def main() -> None:
         log.info("Эфемерные сообщения включены: TTL=%s c.", EPHEMERAL_TTL)
     if BUG_TOPIC_ID or FEATURE_TOPIC_ID:
         log.info("Гейтинг тем: bug=%s, feature=%s", BUG_TOPIC_ID, FEATURE_TOPIC_ID)
+    if GROUP_ID is not None:
+        log.info("Доступ только участникам группы %s (не-участникам — только /join).", GROUP_ID)
 
     try:
         await dp.start_polling(bot)
