@@ -22,7 +22,16 @@ from aiogram import Bot, BaseMiddleware, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, ReplyParameters
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyParameters,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -80,6 +89,17 @@ EPHEMERAL_TTL = _parse_optional_int("EPHEMERAL_TTL", 0) or 0
 # группы; остальным доступна лишь команда /join (заявка на вступление).
 # Пусто — ограничение выключено, бот доступен всем (как раньше).
 GROUP_ID = _parse_optional_int("GROUP_ID")
+
+# Ссылка-приглашение в группу и «секретное слово». Если в /join передать секрет
+# (напр. /join Чубака), бот сразу выдаёт ссылку на вступление вместо заявки.
+GROUP_INVITE_LINK = os.getenv("GROUP_INVITE_LINK", "").strip()
+JOIN_SECRET = os.getenv("JOIN_SECRET", "").strip()
+
+# Приветственный стикер, отправляется после сообщения-приглашения.
+WELCOME_STICKER_ID = os.getenv(
+    "WELCOME_STICKER_ID",
+    "CAACAgIAAxkBAAERiuNqVnPGZ3JoPQFyR3luX6t6Ru6tYAACowADIy22FkyTj_pwfbW5PQQ",
+).strip()
 
 # Заполняется в main() из bot.get_me() — нужно для deep-link в личный чат.
 BOT_USERNAME = ""
@@ -545,6 +565,38 @@ def roles_for_user(cfg: dict, user_id: int) -> list[str]:
     return [raw] if isinstance(raw, str) else list(raw)
 
 
+def match_title_to_role(cfg: dict, title: str | None) -> str | None:
+    """Сопоставляет Telegram custom_title с ключом роли (по ключу или title)."""
+    if not title:
+        return None
+    tl = title.strip().casefold()
+    for key, rd in (cfg.get("roles") or {}).items():
+        if key.casefold() == tl or str(rd.get("title", "")).strip().casefold() == tl:
+            return key
+    return None
+
+
+async def get_custom_title(bot: Bot, user_id: int) -> str | None:
+    """Читает custom_title участника группы (доступен только у администраторов)."""
+    if GROUP_ID is None:
+        return None
+    try:
+        member = await bot.get_chat_member(GROUP_ID, user_id)
+        return getattr(member, "custom_title", None)
+    except Exception:
+        log.debug("Не удалось получить custom_title для %s", user_id, exc_info=True)
+        return None
+
+
+async def resolve_roles(bot: Bot, cfg: dict, user_id: int) -> list[str]:
+    """Роли пользователя: из roles.json + (дополнительно) из Telegram custom_title."""
+    roles = list(roles_for_user(cfg, user_id))
+    title_role = match_title_to_role(cfg, await get_custom_title(bot, user_id))
+    if title_role and title_role not in roles:
+        roles.append(title_role)
+    return roles
+
+
 def _code(value) -> str:
     """Моноширинный фрагмент — в Telegram тап по нему копирует значение в буфер."""
     return f"<code>{h(str(value))}</code>"
@@ -676,13 +728,21 @@ def _command_name(text: str | None) -> str | None:
     return token.split("@")[0].lower() or None
 
 
+JOIN_PROMPT_TEXT = (
+    "📜 Голокрон запечатан.\n"
+    "Только достойные смогут открыть его.\n\n"
+    "Введи: <b>/join</b>\n"
+    "<i>И древние знания станут доступны.</i>"
+)
+
+
 async def send_join_prompt(message: Message) -> None:
-    await message.answer(
-        "🚪 Этот бот доступен только участникам группы.\n\n"
-        "Чтобы получить доступ, подайте заявку на вступление командой "
-        "<code>/join</code> (можно добавить короткий комментарий: "
-        "<code>/join я из отдела наладки</code>). Администраторы её рассмотрят."
-    )
+    await message.answer(JOIN_PROMPT_TEXT)
+    if WELCOME_STICKER_ID:
+        try:
+            await message.answer_sticker(WELCOME_STICKER_ID)
+        except Exception:
+            log.debug("Не удалось отправить приветственный стикер", exc_info=True)
 
 
 class MembershipMiddleware(BaseMiddleware):
@@ -734,6 +794,9 @@ HELP_TEXT_USER = """
 
 🖥 Серверы для тестирования (по вашей роли, только в личке):
 <code>/servers</code>
+
+🎭 Узнать свою роль:
+<code>/myrole</code>
 
 🔐 Зарегистрироваться (отправить свои данные администратору):
 <code>/signin</code>
@@ -824,7 +887,23 @@ async def cmd_join(message: Message, command: CommandObject):
         await message.answer("✅ Вы уже участник группы — заявка не нужна.")
         return
 
-    note = (command.args or "").strip()[:500]
+    arg = (command.args or "").strip()
+
+    # Секретное слово — сразу выдаём ссылку на вступление, минуя заявку.
+    if JOIN_SECRET and arg.casefold() == JOIN_SECRET.casefold():
+        if GROUP_INVITE_LINK:
+            builder = InlineKeyboardBuilder()
+            builder.button(text="🔓 Войти в круг посвящённых", url=GROUP_INVITE_LINK)
+            await message.answer(
+                "🗝 Голокрон признал тебя достойным. Проход открыт 👇",
+                reply_markup=builder.as_markup(),
+            )
+        else:
+            await message.answer("🗝 Слово верное, но проход не настроен. Сообщите хранителю (администратору).")
+            log.warning("JOIN_SECRET верный, но GROUP_INVITE_LINK не задан в .env")
+        return
+
+    note = arg[:500]
     is_new = await asyncio.to_thread(
         db_add_join_request, user.id, user.username or "", user.full_name, note
     )
@@ -943,7 +1022,8 @@ async def cmd_servers(message: Message):
         await message.answer("⚠️ Список серверов сейчас недоступен. Обратитесь к администратору.")
         return
 
-    roles = [r for r in roles_for_user(cfg, message.from_user.id) if r in (cfg.get("roles") or {})]
+    all_roles = await resolve_roles(message.bot, cfg, message.from_user.id)
+    roles = [r for r in all_roles if r in (cfg.get("roles") or {})]
     if not roles:
         await message.answer(
             "У вас нет доступа к списку серверов.\n"
@@ -952,6 +1032,24 @@ async def cmd_servers(message: Message):
         return
 
     await reply_long(message, f"🖥 <b>Доступные серверы</b>\n\n{format_servers(cfg, roles)}")
+
+
+@router.message(Command("myrole"))
+async def cmd_myrole(message: Message):
+    if not is_private(message):
+        await redirect_to_private(message, "🎭 Ваша роль — в личном чате.")
+        return
+    cfg = await asyncio.to_thread(load_roles_config)
+    if not cfg:
+        await message.answer("⚠️ Роли сейчас недоступны. Обратитесь к администратору.")
+        return
+    roles_def = cfg.get("roles") or {}
+    roles = await resolve_roles(message.bot, cfg, message.from_user.id)
+    titles = [str(roles_def[r].get("title", r)) for r in roles if r in roles_def]
+    if not titles:
+        await message.answer("У вас пока нет назначенной роли. Обратитесь к администратору.")
+        return
+    await message.answer("🎭 Ваши роли: " + ", ".join(f"<b>{h(t)}</b>" for t in titles))
 
 
 # Сколько секунд показывать подтверждение /signin перед авто-удалением.
@@ -1227,6 +1325,61 @@ async def cb_set_status(callback: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
+# Меню команд (всплывает при вводе «/»)
+# ---------------------------------------------------------------------------
+
+# ВНИМАНИЕ: Telegram не поддерживает меню команд для отдельной темы форума —
+# scope бывает «личка / группа / конкретный чат», но не по message_thread_id.
+# Поэтому в группе список одинаков во всех темах.
+
+PRIVATE_COMMANDS = [
+    BotCommand(command="servers", description="🖥 Серверы по вашей роли"),
+    BotCommand(command="myrole", description="🎭 Ваша роль"),
+    BotCommand(command="mytickets", description="📋 Мои заявки"),
+    BotCommand(command="status", description="🔎 Статус заявки по номеру"),
+    BotCommand(command="signin", description="🔐 Зарегистрироваться"),
+    BotCommand(command="help", description="❓ Помощь"),
+]
+
+GROUP_COMMANDS = [
+    BotCommand(command="bug", description="🐞 Сообщить о баге"),
+    BotCommand(command="feature", description="💡 Предложить фичу"),
+    BotCommand(command="signin", description="🔐 Зарегистрироваться"),
+    BotCommand(command="bot", description="🤖 Открыть бота в личке"),
+]
+
+ADMIN_EXTRA_COMMANDS = [
+    BotCommand(command="list", description="📋 Список заявок"),
+    BotCommand(command="view", description="🔍 Открыть заявку"),
+    BotCommand(command="setstatus", description="✏️ Сменить статус"),
+    BotCommand(command="comment", description="💬 Комментарий к заявке"),
+    BotCommand(command="users", description="👥 Зарегистрированные пользователи"),
+    BotCommand(command="requests", description="🚪 Заявки на вступление"),
+    BotCommand(command="panel", description="📌 Панель в группу"),
+    BotCommand(command="reset", description="🗑 Очистить базу"),
+    BotCommand(command="version", description="ℹ️ Версия бота"),
+]
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    """Устанавливает меню команд для лички, группы и (расширенное) для админов."""
+    try:
+        await bot.set_my_commands(PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats())
+        await bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.set_my_commands(
+                    PRIVATE_COMMANDS + ADMIN_EXTRA_COMMANDS,
+                    scope=BotCommandScopeChat(chat_id=admin_id),
+                )
+            except Exception:
+                # админ ещё не открывал личный чат с ботом и т.п. — не критично
+                log.debug("Не удалось задать меню для админа %s", admin_id, exc_info=True)
+    except Exception:
+        log.warning("Не удалось установить меню команд", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
 
@@ -1240,6 +1393,7 @@ async def main() -> None:
 
     me = await bot.get_me()
     BOT_USERNAME = me.username
+    await setup_bot_commands(bot)
     log.info("Бот запущен как @%s.", BOT_USERNAME)
     if EPHEMERAL_TTL > 0:
         log.info("Эфемерные сообщения включены: TTL=%s c.", EPHEMERAL_TTL)
