@@ -192,18 +192,23 @@ def db_init() -> None:
             con.execute("ALTER TABLE tickets ADD COLUMN message_thread_id INTEGER")
         con.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON tickets(user_id)")
-        # Реестр пользователей, зарегистрировавшихся через /signin.
+        # Реестр пользователей (через /signin и захват sender_tag из группы).
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 full_name TEXT,
+                tag TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
             """
         )
+        # Миграция для баз, созданных до появления колонки tag.
+        ucols = {r["name"] for r in con.execute("PRAGMA table_info(users)")}
+        if "tag" not in ucols:
+            con.execute("ALTER TABLE users ADD COLUMN tag TEXT")
         # Заявки на вступление в группу (/join).
         con.execute(
             """
@@ -326,6 +331,31 @@ def db_list_users(limit: int = 500):
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def db_update_user_tag(user_id: int, username: str, full_name: str, tag: str) -> None:
+    """Сохраняет sender_tag пользователя (создаёт запись, если её ещё нет)."""
+    now = _now()
+    with closing(_connect()) as con:
+        con.execute(
+            """
+            INSERT INTO users (user_id, username, full_name, tag, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
+                full_name = excluded.full_name,
+                tag = excluded.tag,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, username, full_name, tag, now, now),
+        )
+        con.commit()
+
+
+def db_get_user_tag(user_id: int) -> str | None:
+    with closing(_connect()) as con:
+        row = con.execute("SELECT tag FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return row["tag"] if row else None
 
 
 def db_add_join_request(user_id: int, username: str, full_name: str, note: str) -> bool:
@@ -593,11 +623,21 @@ async def get_custom_title(bot: Bot, user_id: int) -> str | None:
 
 
 async def resolve_roles(bot: Bot, cfg: dict, user_id: int) -> list[str]:
-    """Роли пользователя: из roles.json + (дополнительно) из Telegram custom_title."""
+    """Роли пользователя из всех источников:
+
+    1) секция users в roles.json (по user_id);
+    2) Telegram custom_title (только у администраторов);
+    3) sender_tag обычного участника, сохранённый при сообщении в группе.
+    """
     roles = list(roles_for_user(cfg, user_id))
-    title_role = match_title_to_role(cfg, await get_custom_title(bot, user_id))
-    if title_role and title_role not in roles:
-        roles.append(title_role)
+    sources = [
+        await get_custom_title(bot, user_id),
+        await asyncio.to_thread(db_get_user_tag, user_id),
+    ]
+    for source in sources:
+        key = match_title_to_role(cfg, source)
+        if key and key not in roles:
+            roles.append(key)
     return roles
 
 
@@ -771,6 +811,25 @@ class MembershipMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+class TagCaptureMiddleware(BaseMiddleware):
+    """Запоминает sender_tag автора из сообщений супергруппы.
+
+    В личке /servers и /myrole берут сохранённый тег как источник роли —
+    поэтому важно перехватить его, когда участник пишет в группе.
+    """
+
+    async def __call__(self, handler, event: Message, data):
+        tag = getattr(event, "sender_tag", None)
+        if tag and getattr(event, "from_user", None):
+            u = event.from_user
+            try:
+                await asyncio.to_thread(db_update_user_tag, u.id, u.username or "", u.full_name, tag)
+            except Exception:
+                log.debug("Не удалось сохранить sender_tag для %s", u.id, exc_info=True)
+        return await handler(event, data)
+
+
+router.message.outer_middleware(TagCaptureMiddleware())
 router.message.outer_middleware(MembershipMiddleware())
 
 
@@ -836,6 +895,9 @@ HELP_TEXT_ADMIN = """
 
 🚪 Заявки на вступление в группу:
 <code>/requests</code>
+
+🏷 Назначить метку участнику (роль без прав админа):
+<code>/settag USER_ID метка</code>
 
 📌 Опубликовать в группе панель с кнопкой «Открыть бота» (вызывать в группе):
 <code>/panel</code>
@@ -1304,8 +1366,41 @@ async def cmd_users(message: Message):
     lines = []
     for u in users:
         handle = f"@{h(u['username'])}" if u["username"] else "—"
-        lines.append(f"• {h(u['full_name'] or '—')} ({handle}) — <code>{u['user_id']}</code>")
+        line = f"• {h(u['full_name'] or '—')} ({handle}) — <code>{u['user_id']}</code>"
+        if u.get("tag"):
+            line += f" 🏷 {h(u['tag'])}"
+        lines.append(line)
     await reply_long(message, f"<b>Зарегистрированные пользователи ({len(users)}):</b>\n\n" + "\n".join(lines))
+
+
+@router.message(Command("settag"))
+async def cmd_settag(message: Message, command: CommandObject):
+    if await admin_command_blocked(message):
+        return
+    if GROUP_ID is None:
+        await message.answer("⚠️ Для меток нужно задать GROUP_ID в .env.")
+        return
+    parts = (command.args or "").split(maxsplit=1)
+    if not parts or not parts[0].lstrip("-").isdigit():
+        await message.answer(
+            "⚠️ Формат: <code>/settag USER_ID метка</code>\n"
+            "Пустая метка снимает её: <code>/settag USER_ID</code>"
+        )
+        return
+    target_id = int(parts[0])
+    tag = parts[1].strip() if len(parts) > 1 else ""
+    try:
+        await message.bot.set_chat_member_tag(GROUP_ID, target_id, tag)
+    except Exception as e:
+        log.warning("set_chat_member_tag не удался: %s", e, exc_info=True)
+        await message.answer(
+            "❌ Не удалось назначить метку. Проверьте, что бот — администратор группы "
+            "с правом «Управление метками» (can_manage_tags), а пользователь состоит в группе."
+        )
+        return
+    await message.answer(
+        f"🏷 Метка для <code>{target_id}</code> " + (f"установлена: {h(tag)}." if tag else "снята.")
+    )
 
 
 @router.message(Command("requests"))
@@ -1393,6 +1488,7 @@ ADMIN_EXTRA_COMMANDS = [
     BotCommand(command="comment", description="💬 Комментарий к заявке"),
     BotCommand(command="users", description="👥 Зарегистрированные пользователи"),
     BotCommand(command="requests", description="🚪 Заявки на вступление"),
+    BotCommand(command="settag", description="🏷 Назначить метку участнику"),
     BotCommand(command="panel", description="📌 Панель в группу"),
     BotCommand(command="reset", description="🗑 Очистить базу"),
     BotCommand(command="version", description="ℹ️ Версия бота"),
