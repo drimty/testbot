@@ -31,6 +31,7 @@ from aiogram.types import (
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     CallbackQuery,
+    ChatMemberUpdated,
     ForceReply,
     InlineKeyboardMarkup,
     Message,
@@ -358,6 +359,12 @@ def db_get_user_tag(user_id: int) -> str | None:
         return row["tag"] if row else None
 
 
+def db_get_user(user_id: int):
+    with closing(_connect()) as con:
+        row = con.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
 def db_add_join_request(user_id: int, username: str, full_name: str, note: str) -> bool:
     """Сохраняет/обновляет заявку на вступление. True — если заявка новая."""
     now = _now()
@@ -620,6 +627,56 @@ async def get_custom_title(bot: Bot, user_id: int) -> str | None:
     except Exception:
         log.debug("Не удалось получить custom_title для %s", user_id, exc_info=True)
         return None
+
+
+def join_config(cfg: dict | None) -> dict:
+    """Секция join из roles.json: секретные слова, ссылки и роль по умолчанию."""
+    j = (cfg or {}).get("join") or {}
+    return {
+        "secrets": {str(k).strip().casefold(): v for k, v in (j.get("secrets") or {}).items()},
+        "links": j.get("links") or {},
+        "default_role": j.get("default_role"),
+    }
+
+
+def role_for_secret(cfg: dict | None, word: str) -> str | None:
+    return join_config(cfg)["secrets"].get((word or "").strip().casefold())
+
+
+def link_for_role(cfg: dict | None, role: str | None) -> str:
+    """Ссылка-приглашение для КОНКРЕТНОЙ роли.
+
+    Общая ссылка ('default') намеренно не возвращается: бот её не выдаёт,
+    она нужна только для ручной раздачи участниками/админами.
+    """
+    if not role:
+        return ""
+    return (join_config(cfg)["links"] or {}).get(role) or ""
+
+
+def role_for_invite_link(cfg: dict | None, url: str | None) -> str | None:
+    """Роль по ссылке, через которую вошёл участник.
+
+    None — если ссылки нет (добавлен вручную) или она боту неизвестна:
+    в этом случае метку не ставим, её назначит администратор.
+    """
+    if not url:
+        return None
+    jc = join_config(cfg)
+    for role, link in jc["links"].items():
+        if role != "default" and link == url:
+            return role
+    if jc["links"].get("default") == url:
+        return jc["default_role"]  # общая ссылка -> роль по умолчанию (Youngling)
+    return None
+
+
+def tag_for_role(cfg: dict | None, role: str | None) -> str | None:
+    """Текст метки для роли — её title из roles.json."""
+    if not role:
+        return None
+    rd = ((cfg or {}).get("roles") or {}).get(role) or {}
+    return str(rd.get("title") or role)
 
 
 async def resolve_roles(bot: Bot, cfg: dict, user_id: int) -> list[str]:
@@ -954,21 +1011,34 @@ async def cmd_join(message: Message, command: CommandObject):
         return
 
     arg = (command.args or "").strip()
+    cfg = await asyncio.to_thread(load_roles_config)
 
-    # Секретное слово — сразу выдаём ссылку на вступление, минуя заявку.
-    if JOIN_SECRET and arg.casefold() == JOIN_SECRET.casefold():
-        if GROUP_INVITE_LINK:
-            builder = InlineKeyboardBuilder()
-            builder.button(text="🔓 Войти в круг посвящённых", url=GROUP_INVITE_LINK)
-            await message.answer(
-                "🗝 Голокрон признал тебя достойным. Проход открыт 👇",
-                reply_markup=builder.as_markup(),
-            )
-        else:
-            await message.answer("🗝 Слово верное, но проход не настроен. Сообщите хранителю (администратору).")
-            log.warning("JOIN_SECRET верный, но GROUP_INVITE_LINK не задан в .env")
+    # Ссылку выдаём ТОЛЬКО по верному секретному слову — чтобы случайные люди
+    # не получали доступ. Без секрета человек попадает в заявки к админам.
+    role = role_for_secret(cfg, arg)
+    link = link_for_role(cfg, role)
+    if not link and JOIN_SECRET and arg.casefold() == JOIN_SECRET.casefold():
+        link = GROUP_INVITE_LINK  # совместимость со старой одиночной схемой
+
+    if link:
+        # Фиксируем «ссылку выдали, но человек ещё не вступил» — видно в /requests.
+        await asyncio.to_thread(
+            db_add_join_request,
+            user.id,
+            user.username or "",
+            user.full_name,
+            f"ссылка для роли: {role or 'общая'}",
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔓 Войти в круг посвящённых", url=link)
+        await message.answer(
+            "🗝 Голокрон признал тебя. Проход открыт 👇\n"
+            "<i>Роль будет присвоена автоматически при входе.</i>",
+            reply_markup=builder.as_markup(),
+        )
         return
 
+    # Ссылки не настроены — старое поведение: заявка администраторам.
     note = arg[:500]
     is_new = await asyncio.to_thread(
         db_add_join_request, user.id, user.username or "", user.full_name, note
@@ -1398,6 +1468,16 @@ async def cmd_settag(message: Message, command: CommandObject):
             "с правом «Управление метками» (can_manage_tags), а пользователь состоит в группе."
         )
         return
+
+    # Сохраняем локально, иначе роль подхватилась бы лишь после сообщения пользователя.
+    existing = await asyncio.to_thread(db_get_user, target_id)
+    await asyncio.to_thread(
+        db_update_user_tag,
+        target_id,
+        (existing or {}).get("username") or "",
+        (existing or {}).get("full_name") or "",
+        tag,
+    )
     await message.answer(
         f"🏷 Метка для <code>{target_id}</code> " + (f"установлена: {h(tag)}." if tag else "снята.")
     )
@@ -1457,6 +1537,59 @@ async def cb_set_status(callback: CallbackQuery):
     await notify_group(callback.bot, ticket, f"🔔 Статус вашей заявки #{ticket_id} изменён: {STATUS_LABELS[status]}")
 
 
+def _is_in_chat(member) -> bool:
+    if member.status in _MEMBER_STATUSES_IN:
+        return True
+    return member.status == "restricted" and bool(getattr(member, "is_member", False))
+
+
+@router.chat_member()
+async def on_member_joined(event: ChatMemberUpdated):
+    """Новый участник: присваиваем метку по ссылке, чистим заявку, уведомляем админов."""
+    if GROUP_ID is not None and event.chat.id != GROUP_ID:
+        return
+    if _is_in_chat(event.old_chat_member) or not _is_in_chat(event.new_chat_member):
+        return  # интересует только переход «не участник → участник»
+
+    user = event.new_chat_member.user
+    link_url = event.invite_link.invite_link if event.invite_link else None
+
+    cfg = await asyncio.to_thread(load_roles_config)
+    role = role_for_invite_link(cfg, link_url)
+    tag = tag_for_role(cfg, role)
+
+    if not tag:
+        # Добавлен вручную или по неизвестной ссылке — метку назначает админ.
+        tag_result = (
+            "метка не назначена (вошёл не по известной ссылке)\n"
+            f"Назначить: <code>/settag {user.id} Роль</code>"
+        )
+    else:
+        try:
+            await event.bot.set_chat_member_tag(event.chat.id, user.id, tag)
+            # Сохраняем сразу — иначе роль подхватилась бы лишь после его сообщения.
+            await asyncio.to_thread(
+                db_update_user_tag, user.id, user.username or "", user.full_name, tag
+            )
+            tag_result = f"метка: {h(tag)}"
+        except Exception as e:
+            log.warning("Не удалось присвоить метку '%s' пользователю %s: %s", tag, user.id, e)
+            tag_result = "метку присвоить не удалось (нужно право can_manage_tags)"
+
+    await asyncio.to_thread(db_delete_join_request, user.id)
+    _member_cache.pop(user.id, None)  # чтобы доступ заработал сразу, без ожидания TTL
+
+    handle = f"@{h(user.username)}" if user.username else "—"
+    await notify_admins(
+        event.bot,
+        f"➕ Новый участник:\n"
+        f"Имя: {h(user.full_name)}\n"
+        f"Username: {handle}\n"
+        f"ID: <code>{user.id}</code>\n"
+        f"{tag_result}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Меню команд (всплывает при вводе «/»)
 # ---------------------------------------------------------------------------
@@ -1470,14 +1603,12 @@ PRIVATE_COMMANDS = [
     BotCommand(command="myrole", description="🎭 Ваша роль"),
     BotCommand(command="mytickets", description="📋 Мои заявки"),
     BotCommand(command="status", description="🔎 Статус заявки по номеру"),
-    BotCommand(command="signin", description="🔐 Зарегистрироваться"),
     BotCommand(command="help", description="❓ Помощь"),
 ]
 
 GROUP_COMMANDS = [
     BotCommand(command="bug", description="🐞 Сообщить о баге"),
     BotCommand(command="feature", description="💡 Предложить фичу"),
-    BotCommand(command="signin", description="🔐 Зарегистрироваться"),
     BotCommand(command="bot", description="🤖 Открыть бота в личке"),
 ]
 

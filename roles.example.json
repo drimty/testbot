@@ -1,5 +1,19 @@
 {
-  "_comment": "Скопируйте в roles.json на сервере и заполните. roles.json в git не попадает. Бот перечитывает файл на каждый /servers — перезапуск не нужен. В Telegram тап по адресу/порту/имени БД/логину/паролю копирует значение в буфер.",
+  "_comment": "Скопируйте в roles.json на сервере и заполните. roles.json в git не попадает. Бот перечитывает файл на каждый запрос — перезапуск не нужен. В Telegram тап по адресу/порту/имени БД/логину/паролю копирует значение в буфер.",
+
+  "join": {
+    "_comment": "Секретные слова для /join -> роль. Ссылки-приглашения создайте в настройках группы (по одной на роль + общая). При входе бот определит роль по ссылке и сам поставит метку.",
+    "secrets": {
+      "Чубака": "naladchik",
+      "Йода": "metrolog"
+    },
+    "links": {
+      "naladchik": "https://t.me/+ССЫЛКА_ДЛЯ_НАЛАДЧИКА",
+      "metrolog": "https://t.me/+ССЫЛКА_ДЛЯ_МЕТРОЛОГА",
+      "default": "https://t.me/+ОБЩАЯ_ССЫЛКА"
+    },
+    "default_role": "youngling"
+  },
 
   "users": {
     "111111111": ["naladchik"],
@@ -7,6 +21,11 @@
   },
 
   "roles": {
+    "youngling": {
+      "title": "Youngling",
+      "servers": []
+    },
+
     "naladchik": {
       "title": "Наладчик",
       "servers": [
@@ -21,14 +40,6 @@
             {"username": "admin",  "password": "passForAdmin",  "desc": "суперпользователь"},
             {"username": "editor", "password": "passForEditor", "desc": "редактор"},
             {"username": "user",   "password": "passForUser",   "desc": "только просмотр, редактирование недоступно"}
-          ]
-        },
-        {
-          "title": "Сервер 2",
-          "hosts": [{"address": "150.0.1.10", "port": 5432}],
-          "db": "second_DB",
-          "accounts": [
-            {"username": "admin", "password": "secret2", "desc": "суперпользователь"}
           ]
         }
       ]
