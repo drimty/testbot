@@ -13,7 +13,7 @@ import logging
 import os
 import sqlite3
 import time
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime, timezone
 from html import escape as h
 from pathlib import Path
@@ -34,10 +34,12 @@ from aiogram.types import (
     ChatMemberUpdated,
     ForceReply,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     Message,
     ReplyParameters,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -139,6 +141,29 @@ STATUS_LABELS = {
 STATUS_CODES = {"n": STATUS_NEW, "p": STATUS_IN_PROGRESS, "d": STATUS_DONE, "r": STATUS_REJECTED}
 
 TYPE_LABELS = {"bug": "🐞 Баг", "feature": "💡 Фича"}
+TYPE_EMOJI = {"bug": "🐞", "feature": "💡"}
+
+# Приоритет заявки: 0 — обычный, 1 — 🟡 средний, 2 — 🔴 высокий.
+PRIORITY_NONE = 0
+PRIORITY_MED = 1
+PRIORITY_HIGH = 2
+PRIORITY_ICON = {PRIORITY_MED: "🟡", PRIORITY_HIGH: "🔴"}
+PRIORITY_LABELS = {
+    PRIORITY_NONE: "обычный",
+    PRIORITY_MED: "🟡 средний",
+    PRIORITY_HIGH: "🔴 высокий",
+}
+# Разбор аргумента /priority: слово -> код.
+PRIORITY_WORDS = {
+    "none": PRIORITY_NONE, "0": PRIORITY_NONE, "обычный": PRIORITY_NONE, "-": PRIORITY_NONE,
+    "med": PRIORITY_MED, "medium": PRIORITY_MED, "1": PRIORITY_MED, "средний": PRIORITY_MED,
+    "high": PRIORITY_HIGH, "2": PRIORITY_HIGH, "высокий": PRIORITY_HIGH,
+}
+
+# Ключ настройки, где хранится расположение доски (чат/тема/message_id).
+BOARD_SETTING_KEY = "board_location"
+BOARD_MAX_ACTIVE = 15   # сколько строк на секцию «Новые» / «В работе»
+BOARD_MAX_DONE = 5      # сколько последних выполненных показывать
 
 # Лимит длины одного сообщения в Telegram.
 TELEGRAM_MSG_LIMIT = 4096
@@ -191,8 +216,31 @@ def db_init() -> None:
         cols = {r["name"] for r in con.execute("PRAGMA table_info(tickets)")}
         if "message_thread_id" not in cols:
             con.execute("ALTER TABLE tickets ADD COLUMN message_thread_id INTEGER")
+        if "priority" not in cols:
+            con.execute("ALTER TABLE tickets ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
         con.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON tickets(user_id)")
+        # Голоса «важно и мне» за заявки (по одному на пользователя).
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS votes (
+                ticket_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (ticket_id, user_id)
+            )
+            """
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_votes_ticket ON votes(ticket_id)")
+        # Произвольные настройки бота (например, расположение доски заявок).
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
         # Реестр пользователей (через /signin и захват sender_tag из группы).
         con.execute(
             """
@@ -292,11 +340,108 @@ def db_update_comment(ticket_id: int, comment: str) -> None:
         con.commit()
 
 
+def db_update_priority(ticket_id: int, priority: int) -> None:
+    now = _now()
+    with closing(_connect()) as con:
+        con.execute(
+            "UPDATE tickets SET priority = ?, updated_at = ? WHERE id = ?",
+            (priority, now, ticket_id),
+        )
+        con.commit()
+
+
+def db_vote_count(ticket_id: int) -> int:
+    with closing(_connect()) as con:
+        return con.execute(
+            "SELECT COUNT(*) FROM votes WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()[0]
+
+
+def db_toggle_vote(ticket_id: int, user_id: int) -> tuple[bool, int]:
+    """Ставит/снимает голос. Возвращает (проголосовал_ли_сейчас, всего_голосов)."""
+    with closing(_connect()) as con:
+        exists = con.execute(
+            "SELECT 1 FROM votes WHERE ticket_id = ? AND user_id = ?", (ticket_id, user_id)
+        ).fetchone()
+        if exists:
+            con.execute(
+                "DELETE FROM votes WHERE ticket_id = ? AND user_id = ?", (ticket_id, user_id)
+            )
+            voted = False
+        else:
+            con.execute(
+                "INSERT INTO votes (ticket_id, user_id, created_at) VALUES (?, ?, ?)",
+                (ticket_id, user_id, _now()),
+            )
+            voted = True
+        count = con.execute(
+            "SELECT COUNT(*) FROM votes WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()[0]
+        con.commit()
+        return voted, count
+
+
+def db_count_status(status: str) -> int:
+    with closing(_connect()) as con:
+        return con.execute(
+            "SELECT COUNT(*) FROM tickets WHERE status = ?", (status,)
+        ).fetchone()[0]
+
+
+def db_list_board_active(status: str, limit: int):
+    """Заявки статуса с числом голосов, для доски. Сортировка: приоритет, голоса, свежесть."""
+    with closing(_connect()) as con:
+        rows = con.execute(
+            """
+            SELECT t.*, (SELECT COUNT(*) FROM votes v WHERE v.ticket_id = t.id) AS votes
+            FROM tickets t
+            WHERE t.status = ?
+            ORDER BY t.priority DESC, votes DESC, t.id DESC
+            LIMIT ?
+            """,
+            (status, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def db_list_board_done(limit: int):
+    """Последние выполненные заявки (для мини-changelog на доске)."""
+    with closing(_connect()) as con:
+        rows = con.execute(
+            "SELECT * FROM tickets WHERE status = ? ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (STATUS_DONE, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def db_get_setting(key: str) -> str | None:
+    with closing(_connect()) as con:
+        row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+def db_set_setting(key: str, value: str) -> None:
+    with closing(_connect()) as con:
+        con.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        con.commit()
+
+
+def db_del_setting(key: str) -> None:
+    with closing(_connect()) as con:
+        con.execute("DELETE FROM settings WHERE key = ?", (key,))
+        con.commit()
+
+
 def db_reset() -> int:
     """Удаляет все заявки и сбрасывает нумерацию. Возвращает число удалённых."""
     with closing(_connect()) as con:
         n = con.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
         con.execute("DELETE FROM tickets")
+        con.execute("DELETE FROM votes")
         try:
             con.execute("DELETE FROM sqlite_sequence WHERE name='tickets'")
         except sqlite3.OperationalError:
@@ -447,10 +592,15 @@ def format_ticket_short(t: dict) -> str:
 
 def format_ticket_full(t: dict) -> str:
     author = f"@{h(t['username'])}" if t.get("username") else h(t.get("full_name") or str(t["user_id"]))
+    votes = t.get("votes")
+    if votes is None:
+        votes = db_vote_count(t["id"])
     lines = [
         f"<b>Заявка #{t['id']}</b>",
         f"Тип: {TYPE_LABELS.get(t['type'], t['type'])}",
         f"Статус: {STATUS_LABELS.get(t['status'], t['status'])}",
+        f"Приоритет: {PRIORITY_LABELS.get(t.get('priority') or 0, 'обычный')}",
+        f"Голосов: 👍 {votes}",
         f"Автор: {author}",
         f"Создано: {t['created_at']} UTC",
         "",
@@ -465,8 +615,142 @@ def status_keyboard(ticket_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for code, status in STATUS_CODES.items():
         builder.button(text=STATUS_LABELS[status], callback_data=f"st:{ticket_id}:{code}")
-    builder.adjust(2)
+    # Отдельная строка — приоритет.
+    builder.button(text="🔴 Высокий", callback_data=f"prio:{ticket_id}:h")
+    builder.button(text="🟡 Средний", callback_data=f"prio:{ticket_id}:m")
+    builder.button(text="⚪ Обычный", callback_data=f"prio:{ticket_id}:n")
+    builder.adjust(2, 2, 3)  # 4 статуса по два в ряд, затем 3 приоритета
     return builder.as_markup()
+
+
+# --- Голосование «важно и мне» -------------------------------------------
+
+PRIORITY_CODES = {"h": PRIORITY_HIGH, "m": PRIORITY_MED, "n": PRIORITY_NONE}
+
+
+def vote_keyboard(ticket_id: int, count: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    label = f"👍 {count}" if count else "👍 Важно и мне"
+    builder.button(text=label, callback_data=f"vote:{ticket_id}")
+    return builder.as_markup()
+
+
+# --- Доска активных заявок -------------------------------------------------
+
+
+def _msg_link(chat_id, thread_id, message_id) -> str:
+    """Ссылка на сообщение в супергруппе (t.me/c/...). Пусто — если не супергруппа."""
+    s = str(chat_id)
+    if not s.startswith("-100"):
+        return ""
+    internal = s[4:]
+    if thread_id:
+        return f"https://t.me/c/{internal}/{thread_id}/{message_id}"
+    return f"https://t.me/c/{internal}/{message_id}"
+
+
+def _board_line(t: dict, votes: int = 0) -> str:
+    title = " ".join((t.get("text") or "").split())
+    if len(title) > 60:
+        title = title[:59] + "…"
+    url = _msg_link(t.get("chat_id"), t.get("message_thread_id"), t.get("message_id"))
+    num = f'<a href="{url}">#{t["id"]}</a>' if url else f"#{t['id']}"
+    prio = PRIORITY_ICON.get(t.get("priority") or 0, "")
+    emoji = TYPE_EMOJI.get(t.get("type"), "")
+    line = f"{(prio + ' ') if prio else ''}{num} {emoji} {h(title)}"
+    if votes:
+        line += f" · 👍{votes}"
+    return line
+
+
+def render_board() -> str:
+    """Собирает текст доски (синхронно; вызывать в to_thread)."""
+    now = datetime.now(timezone.utc).strftime("%d.%m %H:%M")
+    in_prog = db_list_board_active(STATUS_IN_PROGRESS, BOARD_MAX_ACTIVE)
+    new = db_list_board_active(STATUS_NEW, BOARD_MAX_ACTIVE)
+    done = db_list_board_done(BOARD_MAX_DONE)
+    n_prog = db_count_status(STATUS_IN_PROGRESS)
+    n_new = db_count_status(STATUS_NEW)
+
+    parts = [f"📋 <b>Заявки</b> · обновлено {now} UTC"]
+
+    def section(title: str, items: list, total: int, cap: int) -> str:
+        block = [f"\n<b>{title}</b> ({total})"]
+        if not items:
+            block.append("—")
+        else:
+            block += [_board_line(t, t.get("votes", 0)) for t in items]
+            if total > cap:
+                block.append(f"…и ещё {total - cap}")
+        return "\n".join(block)
+
+    parts.append(section("🔧 В работе", in_prog, n_prog, BOARD_MAX_ACTIVE))
+    parts.append(section("🆕 Новые", new, n_new, BOARD_MAX_ACTIVE))
+    if done:
+        block = ["\n<b>✅ Готово недавно</b>"]
+        block += [_board_line(t) for t in done]
+        parts.append("\n".join(block))
+
+    parts.append("\n<i>Перед новой заявкой проверьте список.</i> Создать: /bug · /feature")
+    text = "\n".join(parts)
+    if len(text) > TELEGRAM_MSG_LIMIT:
+        text = text[: TELEGRAM_MSG_LIMIT - 2] + "…"
+    return text
+
+
+def _board_get() -> dict | None:
+    raw = db_get_setting(BOARD_SETTING_KEY)
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _board_set(chat_id: int, thread_id, message_id: int) -> None:
+    db_set_setting(
+        BOARD_SETTING_KEY,
+        json.dumps({"chat_id": chat_id, "thread_id": thread_id, "message_id": message_id}),
+    )
+
+
+async def _publish_board(bot: Bot, chat_id: int, thread_id, text: str) -> None:
+    """Публикует новое сообщение-доску, сохраняет его и закрепляет."""
+    sent = await bot.send_message(
+        chat_id, text,
+        message_thread_id=thread_id or None,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        disable_notification=True,
+    )
+    await asyncio.to_thread(_board_set, chat_id, thread_id, sent.message_id)
+    with suppress(Exception):
+        await bot.pin_chat_message(chat_id, sent.message_id, disable_notification=True)
+
+
+async def refresh_board(bot: Bot) -> None:
+    """Перерисовывает доску, если она настроена. Тихо переживает сбои."""
+    loc = await asyncio.to_thread(_board_get)
+    if not loc:
+        return
+    text = await asyncio.to_thread(render_board)
+    try:
+        await bot.edit_message_text(
+            text, chat_id=loc["chat_id"], message_id=loc["message_id"],
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+    except TelegramBadRequest as e:
+        low = str(e).lower()
+        if "not modified" in low:
+            return  # содержимое не изменилось — это норма
+        if "not found" in low or "can't be edited" in low or "to edit" in low:
+            # Сообщение удалили — публикуем заново на том же месте.
+            with suppress(Exception):
+                await _publish_board(bot, loc["chat_id"], loc.get("thread_id"), text)
+        else:
+            log.warning("Доска: не удалось обновить: %s", e)
+    except Exception:
+        log.warning("Доска: ошибка обновления", exc_info=True)
 
 
 def split_message(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
@@ -985,6 +1269,13 @@ HELP_TEXT_ADMIN = """
 📌 Опубликовать в группе панель с кнопкой «Открыть бота» (вызывать в группе):
 <code>/panel</code>
 
+📋 Опубликовать/обновить доску активных заявок (вызывать в группе, в нужной теме;
+отключить — <code>/board off</code>):
+<code>/board</code>
+
+🔴 Задать приоритет заявки (или кнопками в <code>/view</code>):
+<code>/priority НОМЕР high|med|none</code>
+
 🗑 Очистить ВСЕ заявки и сбросить нумерацию:
 <code>/reset CONFIRM</code>
 
@@ -1107,9 +1398,12 @@ async def _finalize_ticket(message: Message, ticket_type: str, text: str) -> Non
     label = "Баг" if ticket_type == "bug" else "Запрос фичи"
     await message.reply(
         f"✅ {label} принят, заявка <b>#{ticket_id}</b>.\n"
-        f"Проверить статус: <code>/status {ticket_id}</code> (в личке /bot)",
+        f"Проверить статус: <code>/status {ticket_id}</code> (в личке /bot)\n"
+        f"👍 <i>Столкнулись с тем же? Поддержите заявку кнопкой ниже.</i>",
+        reply_markup=vote_keyboard(ticket_id, 0),
         disable_notification=True,
     )
+    await refresh_board(message.bot)
 
 
 async def _start_ticket(
@@ -1298,6 +1592,7 @@ async def cmd_cancel(message: Message, command: CommandObject):
 
     await asyncio.to_thread(db_update_status, ticket_id, STATUS_CANCELLED)
     await message.reply(f"🗑 Заявка #{ticket_id} отменена.")
+    await refresh_board(message.bot)
 
     author = f"@{h(ticket['username'])}" if ticket.get("username") else h(
         ticket.get("full_name") or str(ticket["user_id"])
@@ -1347,6 +1642,7 @@ async def cmd_view(message: Message, command: CommandObject):
         await message.reply("❌ Заявка с таким номером не найдена.")
         return
 
+    ticket["votes"] = await asyncio.to_thread(db_vote_count, ticket["id"])
     await message.reply(format_ticket_full(ticket), reply_markup=status_keyboard(ticket["id"]))
 
 
@@ -1369,6 +1665,25 @@ async def cmd_setstatus(message: Message, command: CommandObject):
     await asyncio.to_thread(db_update_status, ticket_id, status)
     await message.reply(f"✅ Статус заявки #{ticket_id} изменён на: {STATUS_LABELS[status]}")
     await notify_group(message.bot, ticket, f"🔔 Статус вашей заявки #{ticket_id} изменён: {STATUS_LABELS[status]}")
+    await refresh_board(message.bot)
+
+
+@router.message(Command("priority"))
+async def cmd_priority(message: Message, command: CommandObject):
+    if await admin_command_blocked(message):
+        return
+    parts = (command.args or "").split()
+    if len(parts) != 2 or not parts[0].isdigit() or parts[1].lower() not in PRIORITY_WORDS:
+        await message.reply("⚠️ Формат: <code>/priority НОМЕР high|med|none</code>")
+        return
+    ticket_id, priority = int(parts[0]), PRIORITY_WORDS[parts[1].lower()]
+    ticket = await asyncio.to_thread(db_get_ticket, ticket_id)
+    if not ticket:
+        await message.reply("❌ Заявка с таким номером не найдена.")
+        return
+    await asyncio.to_thread(db_update_priority, ticket_id, priority)
+    await message.reply(f"🔧 Приоритет заявки #{ticket_id}: {PRIORITY_LABELS[priority]}.")
+    await refresh_board(message.bot)
 
 
 @router.message(Command("comment"))
@@ -1436,6 +1751,40 @@ async def cmd_panel(message: Message):
         )
 
 
+@router.message(Command("board"))
+async def cmd_board(message: Message, command: CommandObject):
+    # Как и /panel: доску публикуем в группе (чтобы закрепить), поэтому обычный
+    # админ-гард (требующий лички) здесь не подходит.
+    if is_private(message):
+        await message.answer(
+            "Команду /board вызывайте <b>в группе</b>, в нужной теме — бот опубликует и "
+            "закрепит там доску активных заявок. Отключить: <code>/board off</code>."
+        )
+        return
+    if not is_admin(message.from_user.id):
+        return  # не-админам в группе молча не отвечаем
+
+    arg = (command.args or "").strip().lower()
+    if arg in ("off", "stop", "удалить", "выкл"):
+        loc = await asyncio.to_thread(_board_get)
+        await asyncio.to_thread(db_del_setting, BOARD_SETTING_KEY)
+        if loc:
+            with suppress(Exception):
+                await message.bot.unpin_chat_message(loc["chat_id"], loc["message_id"])
+        await message.reply("🗑 Доска отключена. Сообщение оставлено, но обновляться не будет.")
+        schedule_delete(message.bot, message.chat.id, message.message_id)
+        return
+
+    text = await asyncio.to_thread(render_board)
+    try:
+        await _publish_board(message.bot, message.chat.id, message.message_thread_id, text)
+    except Exception:
+        log.exception("Не удалось опубликовать доску в чате %s", message.chat.id)
+        await message.reply("⚠️ Не удалось опубликовать доску — детали в логах бота.")
+        return
+    schedule_delete(message.bot, message.chat.id, message.message_id)  # уберём саму команду /board
+
+
 @router.message(Command("reset"))
 async def cmd_reset(message: Message, command: CommandObject):
     if await admin_command_blocked(message):
@@ -1449,6 +1798,7 @@ async def cmd_reset(message: Message, command: CommandObject):
         return
     n = await asyncio.to_thread(db_reset)
     await message.answer(f"🗑 База очищена. Удалено заявок: <b>{n}</b>. Новые заявки начнутся с #1.")
+    await refresh_board(message.bot)
 
 
 @router.message(Command("users"))
@@ -1557,10 +1907,54 @@ async def cb_set_status(callback: CallbackQuery):
 
     await asyncio.to_thread(db_update_status, ticket_id, status)
     ticket["status"] = status
+    ticket["votes"] = await asyncio.to_thread(db_vote_count, ticket_id)
     await callback.message.edit_text(format_ticket_full(ticket), reply_markup=status_keyboard(ticket_id))
     await callback.answer(f"Статус изменён: {STATUS_LABELS[status]}")
 
     await notify_group(callback.bot, ticket, f"🔔 Статус вашей заявки #{ticket_id} изменён: {STATUS_LABELS[status]}")
+    await refresh_board(callback.bot)
+
+
+@router.callback_query(F.data.startswith("prio:"))
+async def cb_set_priority(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Только для администратора.", show_alert=True)
+        return
+
+    _, ticket_id_str, code = callback.data.split(":")
+    ticket_id = int(ticket_id_str)
+    priority = PRIORITY_CODES.get(code)
+    ticket = await asyncio.to_thread(db_get_ticket, ticket_id)
+    if not ticket or priority is None:
+        await callback.answer("❌ Заявка не найдена.", show_alert=True)
+        return
+
+    if (ticket.get("priority") or 0) == priority:
+        await callback.answer("Приоритет уже установлен.")
+        return
+
+    await asyncio.to_thread(db_update_priority, ticket_id, priority)
+    ticket["priority"] = priority
+    ticket["votes"] = await asyncio.to_thread(db_vote_count, ticket_id)
+    with suppress(TelegramBadRequest):
+        await callback.message.edit_text(format_ticket_full(ticket), reply_markup=status_keyboard(ticket_id))
+    await callback.answer(f"Приоритет: {PRIORITY_LABELS[priority]}")
+    await refresh_board(callback.bot)
+
+
+@router.callback_query(F.data.startswith("vote:"))
+async def cb_vote(callback: CallbackQuery):
+    ticket_id = int(callback.data.split(":")[1])
+    ticket = await asyncio.to_thread(db_get_ticket, ticket_id)
+    if not ticket:
+        await callback.answer("❌ Заявка не найдена.", show_alert=True)
+        return
+
+    voted, count = await asyncio.to_thread(db_toggle_vote, ticket_id, callback.from_user.id)
+    with suppress(TelegramBadRequest):
+        await callback.message.edit_reply_markup(reply_markup=vote_keyboard(ticket_id, count))
+    await callback.answer("👍 Голос учтён" if voted else "Голос снят")
+    await refresh_board(callback.bot)
 
 
 def _is_in_chat(member) -> bool:
@@ -1659,7 +2053,9 @@ ADMIN_EXTRA_COMMANDS = [
     BotCommand(command="users", description="👥 Зарегистрированные пользователи"),
     BotCommand(command="requests", description="🚪 Заявки на вступление"),
     BotCommand(command="settag", description="🏷 Назначить метку участнику"),
+    BotCommand(command="priority", description="🔴 Приоритет заявки"),
     BotCommand(command="panel", description="📌 Панель в группу"),
+    BotCommand(command="board", description="📋 Доска заявок в группу"),
     BotCommand(command="reset", description="🗑 Очистить базу"),
     BotCommand(command="version", description="ℹ️ Версия бота"),
 ]
