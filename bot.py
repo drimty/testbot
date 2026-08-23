@@ -396,6 +396,14 @@ def db_list_join_requests(limit: int = 500):
         return [dict(r) for r in rows]
 
 
+def db_get_join_request(user_id: int):
+    with closing(_connect()) as con:
+        row = con.execute(
+            "SELECT * FROM join_requests WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def db_delete_join_request(user_id: int) -> None:
     with closing(_connect()) as con:
         con.execute("DELETE FROM join_requests WHERE user_id = ?", (user_id,))
@@ -677,6 +685,24 @@ def tag_for_role(cfg: dict | None, role: str | None) -> str | None:
         return None
     rd = ((cfg or {}).get("roles") or {}).get(role) or {}
     return str(rd.get("title") or role)
+
+
+# Префикс заметки в заявке, когда ссылку выдали по секрету (см. /join).
+# По этой заметке at-join восстанавливаем намеченную роль, даже если
+# сопоставить event.invite_link не удалось.
+NOTE_ROLE_PREFIX = "ссылка для роли: "
+
+
+def pending_role_from_note(cfg: dict | None, note: str | None) -> str | None:
+    """Роль, намеченная при выдаче ссылки в /join (из заметки заявки)."""
+    if not note or not note.startswith(NOTE_ROLE_PREFIX):
+        return None
+    key = note[len(NOTE_ROLE_PREFIX):].strip()
+    if key in ((cfg or {}).get("roles") or {}):
+        return key
+    if key == "общая":
+        return join_config(cfg)["default_role"]
+    return None
 
 
 async def resolve_roles(bot: Bot, cfg: dict, user_id: int) -> list[str]:
@@ -1027,7 +1053,7 @@ async def cmd_join(message: Message, command: CommandObject):
             user.id,
             user.username or "",
             user.full_name,
-            f"ссылка для роли: {role or 'общая'}",
+            f"{NOTE_ROLE_PREFIX}{role or 'общая'}",
         )
         builder = InlineKeyboardBuilder()
         builder.button(text="🔓 Войти в круг посвящённых", url=link)
@@ -1556,7 +1582,20 @@ async def on_member_joined(event: ChatMemberUpdated):
 
     cfg = await asyncio.to_thread(load_roles_config)
     role = role_for_invite_link(cfg, link_url)
+    source = "ссылка" if role else None
+    if role is None:
+        # Ссылку сопоставить не удалось (её нет в апдейте или формат отличается) —
+        # берём роль, намеченную при выдаче ссылки в /join (заметка заявки).
+        req = await asyncio.to_thread(db_get_join_request, user.id)
+        role = pending_role_from_note(cfg, req.get("note") if req else None)
+        source = "заявка" if role else None
     tag = tag_for_role(cfg, role)
+
+    log.info(
+        "chat_member: user=%s %s->%s invite=%r role=%s(%s) tag=%r",
+        user.id, event.old_chat_member.status, event.new_chat_member.status,
+        link_url, role, source, tag,
+    )
 
     if not tag:
         # Добавлен вручную или по неизвестной ссылке — метку назначает админ.
