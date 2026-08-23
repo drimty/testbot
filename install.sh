@@ -26,6 +26,15 @@ c_green() { echo -e "\e[32m$1\e[0m"; }
 c_yellow() { echo -e "\e[33m$1\e[0m"; }
 c_red() { echo -e "\e[31m$1\e[0m"; }
 
+# Скачивание в обход кэша CDN GitHub. raw.githubusercontent отдаётся через CDN
+# с кэшем ~5 минут, поэтому сразу после git push старый файл может ещё какое-то
+# время «залипать». Уникальный query-параметр (разный ключ кэша) + заголовки
+# no-cache гарантируют свежий файл на каждом запуске.
+dl() {
+    curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+        "$1?cb=$(date +%s%N)" -o "$2"
+}
+
 if [[ $EUID -ne 0 ]]; then
     c_red "Запустите скрипт с правами root: sudo bash install.sh"
     exit 1
@@ -54,7 +63,7 @@ mkdir -p "$INSTALL_DIR"
 # install.sh из репозитория и, если она изменилась, перезапускаемся с неё.
 # Проверка cmp гарантирует, что повторного цикла не будет.
 SELF_TMP="$(mktemp)"
-if curl -fsSL "$REPO_RAW_URL/install.sh" -o "$SELF_TMP" 2>/dev/null && [[ -s "$SELF_TMP" ]]; then
+if dl "$REPO_RAW_URL/install.sh" "$SELF_TMP" 2>/dev/null && [[ -s "$SELF_TMP" ]]; then
     if ! cmp -s "$SELF_TMP" "$0"; then
         echo "==> Обнаружена новая версия install.sh — обновляю и перезапускаю..."
         cp "$SELF_TMP" "$INSTALL_DIR/install.sh"
@@ -67,9 +76,9 @@ rm -f "$SELF_TMP"
 
 echo "==> Скачивание файлов бота из репозитория..."
 TMP_DIR="$(mktemp -d)"
-if ! curl -fsSL "$REPO_RAW_URL/bot.py" -o "$TMP_DIR/bot.py" \
-    || ! curl -fsSL "$REPO_RAW_URL/requirements.txt" -o "$TMP_DIR/requirements.txt" \
-    || ! curl -fsSL "$REPO_RAW_URL/VERSION" -o "$TMP_DIR/VERSION"; then
+if ! dl "$REPO_RAW_URL/bot.py" "$TMP_DIR/bot.py" \
+    || ! dl "$REPO_RAW_URL/requirements.txt" "$TMP_DIR/requirements.txt" \
+    || ! dl "$REPO_RAW_URL/VERSION" "$TMP_DIR/VERSION"; then
     c_red "Не удалось скачать файлы по адресу: $REPO_RAW_URL"
     c_red "Проверьте, что REPO_RAW_URL указывает на правильный репозиторий/ветку и что там лежат bot.py, requirements.txt, VERSION."
     rm -rf "$TMP_DIR"
@@ -78,7 +87,7 @@ fi
 
 # Пример файла ролей — best-effort, обновляем всегда (даже если бот не менялся).
 # Реальный roles.json создаётся вручную и никогда не перезаписывается.
-if curl -fsSL "$REPO_RAW_URL/roles.example.json" -o "$TMP_DIR/roles.example.json" 2>/dev/null; then
+if dl "$REPO_RAW_URL/roles.example.json" "$TMP_DIR/roles.example.json" 2>/dev/null; then
     cp "$TMP_DIR/roles.example.json" "$INSTALL_DIR/roles.example.json"
 fi
 
