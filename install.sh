@@ -133,7 +133,7 @@ if [[ ! -d "$VENV_DIR" ]]; then
     python3 -m venv "$VENV_DIR"
 fi
 "$VENV_DIR/bin/pip" install --upgrade pip -q
-"$VENV_DIR/bin/pip" install -r "$INSTALL_DIR/requirements.txt" -q
+"$VENV_DIR/bin/pip" install -U -r "$INSTALL_DIR/requirements.txt" -q
 
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 

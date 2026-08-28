@@ -39,7 +39,9 @@ from aiogram.types import (
     ReplyParameters,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import ClientDecodeError, TelegramBadRequest
+from aiogram.methods import GetUpdates
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -1908,7 +1910,8 @@ async def cb_set_status(callback: CallbackQuery):
     await asyncio.to_thread(db_update_status, ticket_id, status)
     ticket["status"] = status
     ticket["votes"] = await asyncio.to_thread(db_vote_count, ticket_id)
-    await callback.message.edit_text(format_ticket_full(ticket), reply_markup=status_keyboard(ticket_id))
+    with suppress(TelegramBadRequest):
+        await callback.message.edit_text(format_ticket_full(ticket), reply_markup=status_keyboard(ticket_id))
     await callback.answer(f"Статус изменён: {STATUS_LABELS[status]}")
 
     await notify_group(callback.bot, ticket, f"🔔 Статус вашей заявки #{ticket_id} изменён: {STATUS_LABELS[status]}")
@@ -2080,6 +2083,69 @@ async def setup_bot_commands(bot: Bot) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Устойчивость к неизвестным типам апдейтов
+# ---------------------------------------------------------------------------
+
+
+class ResilientSession(AiohttpSession):
+    """Сессия, которая переживает апдейты, непонятные текущей версии aiogram.
+
+    Telegram регулярно добавляет в Bot API новые объекты (например, блоки
+    rich_message). Пока aiogram их не знает, pydantic валит разбор ВСЕЙ пачки
+    getUpdates, offset не подтверждается, и Telegram отдаёт ту же пачку снова —
+    бот навсегда застревает на одном сообщении и перестаёт отвечать.
+
+    Здесь мы перехватываем такой сбой, читаем пачку сырым JSON (там схемы нет),
+    подтверждаем offset за последним апдейтом и возвращаем пустой список.
+    Непонятые апдейты теряются, но приём остальных не останавливается.
+    """
+
+    async def make_request(self, bot, method, timeout=None):
+        try:
+            return await super().make_request(bot, method, timeout=timeout)
+        except ClientDecodeError:
+            if not isinstance(method, GetUpdates):
+                raise
+            log.error("Не удалось разобрать пачку getUpdates — пропускаю её.", exc_info=True)
+            last = await self._skip_batch(bot, method)
+            if last is None:
+                # Сырой запрос ничего не дал — притормозим, чтобы не крутить цикл вхолостую.
+                await asyncio.sleep(1)
+            else:
+                log.warning("Пропущены апдейты до update_id=%s включительно.", last)
+            return []
+
+    async def _skip_batch(self, bot: Bot, method: GetUpdates) -> int | None:
+        """Читает и подтверждает застрявшую пачку. Возвращает последний update_id."""
+        url = self.api.api_url(token=bot.token, method="getUpdates")
+        params = {"timeout": "0", "limit": str(method.limit or 100)}
+        if method.offset is not None:
+            params["offset"] = str(method.offset)
+        try:
+            # Клиент самой сессии — тот же пул соединений, но в обход моделей aiogram.
+            raw = await self.create_session()
+            async with raw.get(url, params=params) as resp:
+                payload = await resp.json(content_type=None)
+            updates = payload.get("result") or []
+            ids = [
+                u["update_id"] for u in updates
+                if isinstance(u, dict) and isinstance(u.get("update_id"), int)
+            ]
+            if not ids:
+                return None
+            last = max(ids)
+            # offset = last + 1 подтверждает пачку: Telegram убирает её из очереди.
+            async with raw.get(
+                url, params={"offset": str(last + 1), "limit": "1", "timeout": "0"}
+            ):
+                pass
+            return last
+        except Exception:
+            log.warning("Не удалось пропустить битую пачку апдейтов", exc_info=True)
+            return None
+
+
+# ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
 
@@ -2087,7 +2153,11 @@ async def setup_bot_commands(bot: Bot) -> None:
 async def main() -> None:
     global BOT_USERNAME
     db_init()
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(
+        token=BOT_TOKEN,
+        session=ResilientSession(),
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
     dp = Dispatcher(storage=MemoryStorage())  # FSM для двухшагового ввода /bug, /feature
     dp.include_router(router)
 
@@ -2101,6 +2171,11 @@ async def main() -> None:
         log.info("Гейтинг тем: bug=%s, feature=%s", BUG_TOPIC_ID, FEATURE_TOPIC_ID)
     if GROUP_ID is not None:
         log.info("Доступ только участникам группы %s (не-участникам — только /join).", GROUP_ID)
+
+    # Оставшийся с прошлого запуска вебхук молча ломает long polling (409 Conflict),
+    # поэтому снимаем его перед стартом. Очередь апдейтов при этом сохраняем.
+    with suppress(Exception):
+        await bot.delete_webhook(drop_pending_updates=False)
 
     try:
         await dp.start_polling(bot)
