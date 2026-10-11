@@ -14,6 +14,74 @@ Telegram-бот для приёма багов и запросов фич из �
 - `install.sh` — установка и обновление на Ubuntu
 - `.gitignore` — чтобы `.env`, `roles.json` и файлы базы (`tickets.db`, а также WAL-файлы `tickets.db-wal` / `tickets.db-shm`) случайно не попали в git
 
+## Локальная разработка (Windows)
+
+Как поднять проект с нуля на чистой системе для разработки и тестов. Боевой
+запуск — на VPS через `install.sh` (раздел 2 и далее); здесь — про локальную
+машину.
+
+### Что нужно заранее
+- **Python 3.10+** (проект отлаживался на 3.11). Проверка: `python --version`.
+- **Git** и доступ к репозиторию на push (Personal Access Token или SSH-ключ —
+  в репозитории их нет, на новой машине авторизуйтесь заново).
+- **Отдельный тестовый бот** в @BotFather. Не запускайте локального бота с тем же
+  токеном, что крутится на VPS: Telegram отдаёт обновления только одному
+  поллеру, два экземпляра с одним токеном будут мешать друг другу
+  (`terminated by other getUpdates request`).
+
+### Шаги
+
+1. Клонировать и перейти в папку:
+   ```powershell
+   git clone https://github.com/drimty/testbot.git
+   cd testbot
+   ```
+
+2. Создать и активировать виртуальное окружение (PowerShell):
+   ```powershell
+   python -m venv venv
+   .\venv\Scripts\Activate.ps1
+   ```
+   Если PowerShell блокирует активацию, один раз разрешите скрипты для текущего
+   пользователя: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+   (В Git Bash активация другая: `source venv/Scripts/activate`.)
+
+3. Поставить зависимости:
+   ```powershell
+   pip install -r requirements.txt
+   ```
+
+4. Создать локальный `.env` из примера и вписать **тестовый** токен и свой ID:
+   ```powershell
+   Copy-Item .env.example .env
+   notepad .env
+   ```
+   Минимум для запуска — `BOT_TOKEN` и `ADMIN_IDS`. Остальные параметры
+   (`GROUP_ID`, темы, метки и т.д.) можно оставить пустыми — бот будет работать
+   как раньше, без ограничений группы.
+
+5. (Опционально) Для проверки команды `/servers` создать `roles.json`:
+   ```powershell
+   Copy-Item roles.example.json roles.json
+   ```
+
+6. Запустить:
+   ```powershell
+   python bot.py
+   ```
+   В консоли появится `Бот запущен как @username`. Остановить — `Ctrl+C`.
+
+### Важно
+- `.env`, `roles.json`, `tickets.db` (и его WAL-файлы) в git **не попадают** —
+  это локальные/серверные данные. При клонировании их не будет, их создают
+  заново из `*.example` (а боевые — живут только на VPS).
+- База `tickets.db` создаётся автоматически при первом запуске в корне проекта.
+- Git-идентичность на новой машине:
+  ```powershell
+  git config --global user.name "drimty"
+  git config --global user.email "59194691+drimty@users.noreply.github.com"
+  ```
+
 ## 1. Подготовка
 
 ### 1.1 Создайте бота
